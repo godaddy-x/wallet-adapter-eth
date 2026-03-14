@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 
 	"github.com/blockchain/wallet-adapter-eth/eth"
 	"github.com/blockchain/wallet-adapter/chain"
@@ -61,6 +63,7 @@ func main() {
 	}
 
 	fmt.Println("--- 进程阻塞运行中 (Ctrl+C 退出) ---")
-	select {}
-
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	<-sig
 }
