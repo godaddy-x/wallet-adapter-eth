@@ -3,18 +3,18 @@ package eth
 import (
 	"math/big"
 
-	adapter "github.com/blockchain/wallet-adapter"
-	adapterconfig "github.com/blockchain/wallet-adapter/config"
-	"github.com/blockchain/wallet-adapter-eth/internal/config"
-	"github.com/blockchain/wallet-adapter-eth/internal/decoder"
-	"github.com/blockchain/wallet-adapter-eth/internal/manager"
-	"github.com/blockchain/wallet-adapter-eth/internal/rpc"
-	"github.com/blockchain/wallet-adapter/chain"
-	"github.com/blockchain/wallet-adapter/scanner"
-	"github.com/blockchain/wallet-adapter/types"
+	adapter "github.com/godaddy-x/wallet-adapter"
+	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/config"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/decoder"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/manager"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/rpc"
+	"github.com/godaddy-x/wallet-adapter/chain"
+	"github.com/godaddy-x/wallet-adapter/scanner"
+	"github.com/godaddy-x/wallet-adapter/types"
 )
 
-// EthAdapter 实现 wallet-adapter 的 ChainAdapter，用于 ETH 及 EVM 兼容链（BSC、Polygon、Arbitrum 等）
+// EthAdapter 实现 github.com/godaddy-x/wallet-adapter 的 ChainAdapter，用于 ETH 及 EVM 兼容链（BSC、Polygon、Arbitrum 等）
 type EthAdapter struct {
 	chain.ChainAdapterBase
 	wm         *manager.WalletManager
@@ -93,7 +93,7 @@ func (a *EthAdapter) GetSmartContractDecoder() adapter.SmartContractDecoder {
 }
 
 // LoadAssetsConfig 从外部配置回调加载并应用参数（如 serverAPI、broadcastAPI、chainID、gas、nonce 策略等）。
-// cfg 可为实现 wallet-adapter/config.Configer 的对象（如 INI section），或 map[string]string（key 小写匹配）。
+// cfg 可为实现 github.com/godaddy-x/wallet-adapter/config.Configer 的对象（如 INI section），或 map[string]string（key 小写匹配）。
 // 委托 wm.LoadAssetsConfig 更新 Config、MakeDataDir、并初始化 RPC 客户端；未配 chainID 时从节点拉取。
 func (a *EthAdapter) LoadAssetsConfig(cfg interface{}) error {
 	var c adapterconfig.Configer

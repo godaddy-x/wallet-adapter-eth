@@ -1,15 +1,15 @@
-// 本文件为 decoder 包中的 SmartContractDecoder 实现（ERC20 代币余额与元数据），对应 wallet-adapter 的 decoder.SmartContractDecoder 接口。
+// 本文件为 decoder 包中的 SmartContractDecoder 实现（ERC20 代币余额与元数据），对应 github.com/godaddy-x/wallet-adapter 的 decoder.SmartContractDecoder 接口。
 package decoder
 
 import (
 	"fmt"
 	"sync"
 
-	"github.com/blockchain/wallet-adapter-eth/internal/manager"
-	"github.com/blockchain/wallet-adapter-eth/internal/util"
-	adapterdecoder "github.com/blockchain/wallet-adapter/decoder"
-	"github.com/blockchain/wallet-adapter/types"
-	"github.com/blockchain/wallet-adapter/wallet"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/manager"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/util"
+	adapterdecoder "github.com/godaddy-x/wallet-adapter/decoder"
+	"github.com/godaddy-x/wallet-adapter/types"
+	"github.com/godaddy-x/wallet-adapter/wallet"
 )
 
 // EthSmartContractDecoder 实现 adapterdecoder.SmartContractDecoder（ERC20 等），依赖 WalletManager 做 RPC 与 ABI 调用。

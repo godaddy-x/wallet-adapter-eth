@@ -1,14 +1,14 @@
-// Module wallet-adapter-eth：以太坊及 EVM 兼容链的 wallet-adapter 子类，提供 ChainAdapter、TransactionDecoder、AddressDecoder 及 LoadAssetsConfig/INI 配置。
-module github.com/blockchain/wallet-adapter-eth
+// Module github.com/godaddy-x/wallet-adapter-eth：以太坊及 EVM 兼容链的 wallet-adapter 子类，提供 ChainAdapter、TransactionDecoder、AddressDecoder、SmartContractDecoder 及 LoadAssetsConfig/INI 配置。
+module github.com/godaddy-x/wallet-adapter-eth
 
 go 1.26
 
 require (
-	github.com/blockchain/wallet-adapter v0.0.0
 	github.com/ethereum/go-ethereum v1.10.17
+	github.com/godaddy-x/wallet-adapter v0.0.0
 	github.com/imroc/req v0.3.2
 	github.com/tidwall/gjson v1.9.3
-	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
+	golang.org/x/crypto v0.49.0
 )
 
 require (
@@ -26,8 +26,8 @@ require (
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/tklauser/go-sysconf v0.3.5 // indirect
 	github.com/tklauser/numcpus v0.2.2 // indirect
-	golang.org/x/sys v0.0.0-20210816183151-1e6c022a8912 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce // indirect
 )
 
-replace github.com/blockchain/wallet-adapter => ../wallet-adapter
+replace github.com/godaddy-x/wallet-adapter => ../wallet-adapter

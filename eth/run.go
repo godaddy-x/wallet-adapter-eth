@@ -3,11 +3,11 @@ package eth
 import (
 	"fmt"
 
-	adapterconfig "github.com/blockchain/wallet-adapter/config"
-	"github.com/blockchain/wallet-adapter/chain"
+	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
+	"github.com/godaddy-x/wallet-adapter/chain"
 )
 
-// NewAdapter 从 INI 内容创建并注册适配器，通过 LoadAssetsConfig 初始化配置与 RPC 客户端后返回。
+// NewAdapter 从 INI 内容创建并注册适配器，通过 LoadAssetsConfig 初始化配置与 RPC 客户端后返回。依赖 github.com/godaddy-x/wallet-adapter/config 与 chain。
 func NewAdapter(iniContent, symbol, fullName string, decimals int32) (*EthAdapter, error) {
 	kv, err := adapterconfig.KVFromINIContent(iniContent, symbol)
 	if err != nil {

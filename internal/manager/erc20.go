@@ -4,8 +4,8 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/blockchain/wallet-adapter-eth/internal/models"
-	"github.com/blockchain/wallet-adapter-eth/internal/util"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/models"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/util"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	ethcom "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"

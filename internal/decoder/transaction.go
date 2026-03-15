@@ -1,5 +1,5 @@
 // 本文件为 decoder 包中的 TransactionDecoder 实现（EVM 原生 + 可选 ERC20），
-// 对应 wallet-adapter 的 decoder.TransactionDecoder 接口。
+// 对应 github.com/godaddy-x/wallet-adapter 的 decoder.TransactionDecoder 接口。
 package decoder
 
 import (
@@ -9,12 +9,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/blockchain/wallet-adapter-eth/internal/manager"
-	"github.com/blockchain/wallet-adapter-eth/internal/models"
-	"github.com/blockchain/wallet-adapter-eth/internal/util"
-	"github.com/blockchain/wallet-adapter/decoder"
-	"github.com/blockchain/wallet-adapter/types"
-	"github.com/blockchain/wallet-adapter/wallet"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/manager"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/models"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/util"
+	"github.com/godaddy-x/wallet-adapter/decoder"
+	"github.com/godaddy-x/wallet-adapter/types"
+	"github.com/godaddy-x/wallet-adapter/wallet"
 	ethcom "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"

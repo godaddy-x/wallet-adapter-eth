@@ -1,4 +1,4 @@
-// Package config 提供本适配器使用的链配置（EVM 系：RPC、Gas、Nonce 等），依赖 wallet-adapter/config 的 Configer 与 INI 解析。
+// Package config 提供本适配器使用的链配置（EVM 系：RPC、Gas、Nonce 等），依赖 github.com/godaddy-x/wallet-adapter/config 的 Configer 与 INI 解析。
 package config
 
 import (
@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	adapterconfig "github.com/blockchain/wallet-adapter/config"
+	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
 )
 
 // WalletConfig 链配置（RPC、Gas、Nonce 策略等），EVM 子类使用。
@@ -68,7 +68,7 @@ func trimQuoted(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// BuildConfigFromConfiger 从 wallet-adapter 的 Configer 读取并填充 WalletConfig，symbol 作为链标识。
+// BuildConfigFromConfiger 从 github.com/godaddy-x/wallet-adapter 的 Configer 读取并填充 WalletConfig，symbol 作为链标识。
 func BuildConfigFromConfiger(c adapterconfig.Configer, symbol string) *WalletConfig {
 	cfg := NewConfig(symbol)
 	cfg.ServerAPI = trimQuoted(c.String("serverAPI"))

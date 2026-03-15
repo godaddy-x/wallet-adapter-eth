@@ -1,11 +1,13 @@
 # wallet-adapter-eth
 
+**模块路径**：`github.com/godaddy-x/wallet-adapter-eth`
+
 以太坊及 EVM 兼容链的 [wallet-adapter](https://github.com/godaddy-x/wallet-adapter) 子类实现，为 BSC、Polygon、Arbitrum 等提供统一 ChainAdapter。支持原生币与 ERC20 建单、EIP-155 签名、原始交易广播，可与外部 MPC 签名服务配合使用；配置通过 LoadAssetsConfig 回调或 INI 注入，与 quorum-adapter 用法一致。
 
 ## 概述
 
 - **基础框架**：[wallet-adapter](https://github.com/godaddy-x/wallet-adapter) 的 `ChainAdapter`（SymbolInfo、AssetsConfig、TransactionDecoder、BlockScanner、AddressDecoder）。
-- **实现要点**：使用 wallet-adapter 的 `types.RawTransaction`、`wallet.WalletDAI` 等；实现 `decoder.TransactionDecoder`、`decoder.AddressDecoder`；EVM 链配置（WalletConfig）在 internal/config，通用 Configer 与 INI 解析使用 wallet-adapter/config。
+- **实现要点**：使用 github.com/godaddy-x/wallet-adapter 的 `types.RawTransaction`、`wallet.WalletDAI` 等；实现 `decoder.TransactionDecoder`、`decoder.AddressDecoder`、`decoder.SmartContractDecoder`；EVM 链配置（WalletConfig）在 internal/config，通用 Configer 与 INI 解析使用 github.com/godaddy-x/wallet-adapter/config。
 
 ## 项目结构（按功能划分 package）
 
@@ -23,10 +25,11 @@ wallet-adapter-eth/
 │   ├── adapter.go       # EthAdapter、NewEthAdapter
 │   └── run.go           # NewAdapter(iniContent, symbol, fullName, decimals)
 └── internal/            # 内部包（仅本模块使用）
-    ├── config/          # WalletConfig（EVM）、BuildConfigFromConfiger（依赖 wallet-adapter/config 的 Configer/INI）
-    ├── decoder/         # AddressDecoder + TransactionDecoder（对应 wallet-adapter decoder）
+    ├── config/          # WalletConfig（EVM）、BuildConfigFromConfiger（依赖 github.com/godaddy-x/wallet-adapter/config）
+    ├── decoder/         # AddressDecoder、TransactionDecoder、SmartContractDecoder（对应 github.com/godaddy-x/wallet-adapter/decoder）
     │   ├── address.go
-    │   └── transaction.go
+    │   ├── transaction.go
+    │   └── contract.go
     ├── manager/         # WalletManager（RPC、nonce、gas、余额、广播）
     │   └── manager.go
     ├── models/          # TxFeeInfo、AddrBalance、CallMsg
@@ -51,7 +54,7 @@ wallet-adapter-eth/
 
 ```go
 import (
-    "github.com/blockchain/wallet-adapter-eth/eth"
+    "github.com/godaddy-x/wallet-adapter-eth/eth"
 )
 
 // iniContent 可为从文件读取的 INI 文本，或直接写死的配置字符串（见 main.go）
@@ -66,9 +69,9 @@ if err != nil {
 
 ```go
 import (
-    "github.com/blockchain/wallet-adapter/chain"
-    "github.com/blockchain/wallet-adapter-eth/eth"
-    "github.com/blockchain/wallet-adapter-eth/internal/rpc"
+    "github.com/godaddy-x/wallet-adapter/chain"
+    "github.com/godaddy-x/wallet-adapter-eth/eth"
+    "github.com/godaddy-x/wallet-adapter-eth/internal/rpc"
 )
 
 // 连接节点（读写可分离：广播走 BroadcastURL）
@@ -92,8 +95,8 @@ addressDecoder, _ := chain.GetAddressDecoder("ETH")
 
 ```go
 import (
-    "github.com/blockchain/wallet-adapter/chain"
-    "github.com/blockchain/wallet-adapter/flow"
+    "github.com/godaddy-x/wallet-adapter/chain"
+    "github.com/godaddy-x/wallet-adapter/flow"
 )
 
 // wrapper 需实现 wallet.WalletDAI（SignPendingTxData、GetAddressList 等）
@@ -104,13 +107,13 @@ tx, err := flow.SendTransaction(decoder, wrapper, pending)
 
 ### 4. 多链（BSC、Polygon、Arbitrum）
 
-为同一套代码支持多链，使用 `NewEthAdapter(symbol, fullName, decimals)` 创建后调用 `LoadAssetsConfig(c)` 初始化配置与 RPC（c 为 wallet-adapter/config.Configer 或 map[string]string）：
+为同一套代码支持多链，使用 `NewEthAdapter(symbol, fullName, decimals)` 创建后调用 `LoadAssetsConfig(c)` 初始化配置与 RPC（c 为 github.com/godaddy-x/wallet-adapter/config.Configer 或 map[string]string）：
 
 ```go
 import (
-    "github.com/blockchain/wallet-adapter/chain"
-    "github.com/blockchain/wallet-adapter/config"
-    "github.com/blockchain/wallet-adapter-eth/eth"
+    "github.com/godaddy-x/wallet-adapter/chain"
+    "github.com/godaddy-x/wallet-adapter/config"
+    "github.com/godaddy-x/wallet-adapter-eth/eth"
 )
 
 func registerEvmChains() {
@@ -161,9 +164,9 @@ go run . -addr 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
 |------|------|
 | 本 README | 项目概述、结构、依赖、使用方式与能力表 |
 | eth/doc.go | 对外包 eth 的包文档与使用示例 |
-| internal/config | EVM WalletConfig、BuildConfigFromConfiger（依赖 wallet-adapter/config） |
+| internal/config | EVM WalletConfig、BuildConfigFromConfiger（依赖 github.com/godaddy-x/wallet-adapter/config） |
 | internal/manager | WalletManager、LoadAssetsConfig、RPC/余额/广播 |
-| internal/decoder | AddressDecoder + TransactionDecoder（EVM/ERC20） |
+| internal/decoder | AddressDecoder、TransactionDecoder、SmartContractDecoder（EVM/ERC20/ERC20 代币余额与元数据） |
 | internal/rpc、models、util | JSON-RPC 客户端、内部模型、精度与地址工具 |
 
 ## License

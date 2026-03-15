@@ -1,4 +1,4 @@
-// Package decoder 实现 wallet-adapter 的 decoder 分类：AddressDecoder（EVM 地址）与 TransactionDecoder（交易建单/验签/广播）。
+// Package decoder 实现 github.com/godaddy-x/wallet-adapter 的 decoder 分类：AddressDecoder（EVM 地址）与 TransactionDecoder（交易建单/验签/广播）。
 // 本文件为 AddressDecoder 实现（EVM 0x+20 字节）。
 package decoder
 
@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/blockchain/wallet-adapter/decoder"
-	"github.com/blockchain/wallet-adapter-eth/internal/util"
+	"github.com/godaddy-x/wallet-adapter/decoder"
+	"github.com/godaddy-x/wallet-adapter-eth/internal/util"
 	"golang.org/x/crypto/sha3"
 )
 

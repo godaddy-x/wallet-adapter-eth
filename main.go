@@ -1,4 +1,4 @@
-// main 为 wallet-adapter-eth 的测试入口：从内嵌 INI 通过 eth.NewAdapter 创建并注册适配器，打印链信息与可选地址余额/nonce 后阻塞运行。可选 -addr 指定测试地址。
+// main 为本模块 (github.com/godaddy-x/wallet-adapter-eth) 的测试入口：从内嵌 INI 通过 eth.NewAdapter 创建并注册适配器，打印链信息与可选地址余额/nonce 后阻塞运行。可选 -addr 指定测试地址。
 package main
 
 import (
@@ -8,8 +8,8 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/blockchain/wallet-adapter-eth/eth"
-	"github.com/blockchain/wallet-adapter/chain"
+	"github.com/godaddy-x/wallet-adapter-eth/eth"
+	"github.com/godaddy-x/wallet-adapter/chain"
 )
 
 var (
@@ -36,7 +36,7 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println("--- wallet-adapter-eth 已启动 ---")
+	fmt.Println("--- github.com/godaddy-x/wallet-adapter-eth 已启动 ---")
 	fmt.Printf("Symbol: %s, FullName: %s, Decimal: %d\n", adapter.Symbol(), adapter.FullName(), adapter.Decimal())
 	fmt.Printf("ChainID: %d, ServerAPI: %s\n", adapter.Config().ChainID, adapter.Config().ServerAPI)
 
