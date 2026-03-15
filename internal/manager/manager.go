@@ -4,10 +4,11 @@ package manager
 import (
 	"math/big"
 
+	adapterconfig "github.com/blockchain/wallet-adapter/config"
 	"github.com/blockchain/wallet-adapter-eth/internal/config"
-	"github.com/blockchain/wallet-adapter-eth/internal/util"
 	"github.com/blockchain/wallet-adapter-eth/internal/models"
 	"github.com/blockchain/wallet-adapter-eth/internal/rpc"
+	"github.com/blockchain/wallet-adapter-eth/internal/util"
 	"github.com/blockchain/wallet-adapter/types"
 	"github.com/blockchain/wallet-adapter/wallet"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -17,6 +18,29 @@ import (
 type WalletManager struct {
 	Client *rpc.Client
 	Config *config.WalletConfig
+}
+
+// LoadAssetsConfig 从 wallet-adapter 的 Configer 回调加载并应用配置，初始化 RPC 客户端（与 quorum-adapter 用法一致）。
+// 会更新 Config、创建数据目录、Dial 并设置 Client；若未配置 chainID 则从节点拉取。
+func (wm *WalletManager) LoadAssetsConfig(c adapterconfig.Configer) error {
+	symbol := "ETH"
+	if wm.Config != nil {
+		symbol = wm.Config.Symbol
+	}
+	cfg := config.BuildConfigFromConfiger(c, symbol)
+	wm.Config = cfg
+	cfg.MakeDataDir()
+
+	client, err := rpc.Dial(cfg.ServerAPI, cfg.BroadcastAPI)
+	if err != nil {
+		return err
+	}
+	wm.Client = client
+
+	if cfg.ChainID == 0 {
+		_, _ = wm.SetNetworkChainID()
+	}
+	return nil
 }
 
 // GetTransactionCount 获取地址 nonce

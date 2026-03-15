@@ -3,12 +3,13 @@ package eth
 import (
 	"math/big"
 
+	adapter "github.com/blockchain/wallet-adapter"
+	adapterconfig "github.com/blockchain/wallet-adapter/config"
 	"github.com/blockchain/wallet-adapter-eth/internal/config"
-	decoder2 "github.com/blockchain/wallet-adapter-eth/internal/decoder"
+	"github.com/blockchain/wallet-adapter-eth/internal/decoder"
 	"github.com/blockchain/wallet-adapter-eth/internal/manager"
 	"github.com/blockchain/wallet-adapter-eth/internal/rpc"
 	"github.com/blockchain/wallet-adapter/chain"
-	"github.com/blockchain/wallet-adapter/decoder"
 	"github.com/blockchain/wallet-adapter/scanner"
 	"github.com/blockchain/wallet-adapter/types"
 )
@@ -17,18 +18,19 @@ import (
 type EthAdapter struct {
 	chain.ChainAdapterBase
 	wm       *manager.WalletManager
-	txDec    *decoder2.EthTransactionDecoder
-	addrDec  *decoder2.EthAddressDecoder
+	txDec    *decoder.EthTransactionDecoder
+	addrDec  *decoder.EthAddressDecoder
 	symbol   string
 	fullName string
 	decimals int32
 }
 
-// NewEthAdapter 创建以太坊链适配器（symbol 如 ETH、BSC、MATIC、ARB）
-func NewEthAdapter(cfg *config.WalletConfig, symbol, fullName string, decimals int32) *EthAdapter {
-	wm := &manager.WalletManager{Config: cfg}
-	txDec := decoder2.NewTransactionDecoder(wm)
-	addrDec := decoder2.DefaultDecoder
+// NewEthAdapter 创建以太坊链适配器（仅设 symbol/fullName/decimals，Config 与 RPC 客户端由 LoadAssetsConfig 回调初始化，与 quorum 用法一致）
+func NewEthAdapter(symbol, fullName string, decimals int32) *EthAdapter {
+	cfg := config.NewConfig(symbol)
+	wm := &manager.WalletManager{Config: cfg, Client: nil}
+	txDec := decoder.NewTransactionDecoder(wm)
+	addrDec := decoder.DefaultDecoder
 	return &EthAdapter{
 		wm:       wm,
 		txDec:    txDec,
@@ -68,7 +70,7 @@ func (a *EthAdapter) BalanceModelType() types.BalanceModelType {
 }
 
 // GetTransactionDecoder 返回交易解码器
-func (a *EthAdapter) GetTransactionDecoder() decoder.TransactionDecoder {
+func (a *EthAdapter) GetTransactionDecoder() adapter.TransactionDecoder {
 	return a.txDec
 }
 
@@ -78,18 +80,29 @@ func (a *EthAdapter) GetBlockScanner() scanner.BlockScanner {
 }
 
 // GetAddressDecoder 返回地址解码器
-func (a *EthAdapter) GetAddressDecoder() decoder.AddressDecoder {
+func (a *EthAdapter) GetAddressDecoder() adapter.AddressDecoder {
 	return a.addrDec
 }
 
-// LoadAssetsConfig 加载配置（如 serverAPI、broadcastAPI、chainID 等）
-func (a *EthAdapter) LoadAssetsConfig(config interface{}) error {
-	return nil
+// LoadAssetsConfig 从外部配置回调加载并应用参数（如 serverAPI、broadcastAPI、chainID、gas、nonce 策略等）。
+// cfg 可为实现 wallet-adapter/config.Configer 的对象（如 INI section），或 map[string]string（key 小写匹配）。
+// 委托 wm.LoadAssetsConfig 更新 Config、MakeDataDir、并初始化 RPC 客户端；未配 chainID 时从节点拉取。
+func (a *EthAdapter) LoadAssetsConfig(cfg interface{}) error {
+	var c adapterconfig.Configer
+	switch v := cfg.(type) {
+	case adapterconfig.Configer:
+		c = v
+	case map[string]string:
+		c = adapterconfig.MapConfig(v)
+	default:
+		return nil
+	}
+	return a.wm.LoadAssetsConfig(c)
 }
 
-// InitAssetsConfig 初始化默认配置
+// InitAssetsConfig 返回默认配置占位，供框架合并或展示；实际配置建议通过 INI + LoadAssetsConfig 或 NewAdapter(iniContent, ...) 提供。
 func (a *EthAdapter) InitAssetsConfig() (interface{}, error) {
-	return nil, nil
+	return map[string]string{}, nil
 }
 
 // SetClient 设置 RPC 客户端
@@ -97,6 +110,7 @@ func (a *EthAdapter) SetClient(client *rpc.Client) {
 	a.wm.Client = client
 }
 
+// Config 返回链配置（即 wm.Config）
 // Config 返回链配置（即 wm.Config）
 func (a *EthAdapter) Config() *config.WalletConfig {
 	return a.wm.Config
