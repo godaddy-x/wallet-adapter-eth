@@ -29,6 +29,9 @@ type EthTransactionDecoder struct {
 	Wm *manager.WalletManager
 }
 
+// addressListPageSize 分页查询地址时的每页条数，避免一次拉取全部
+const addressListPageSize = int64(50)
+
 // NewTransactionDecoder 创建交易解码器
 func NewTransactionDecoder(wm *manager.WalletManager) *EthTransactionDecoder {
 	return &EthTransactionDecoder{Wm: wm}
@@ -54,7 +57,7 @@ func (d *EthTransactionDecoder) EstimateRawTransactionFee(wrapper wallet.WalletD
 	if rawTx.Account == nil {
 		return types.Errorf(types.ErrCreateRawTransactionFailed, "account is nil")
 	}
-	addresses, err := wrapper.GetAddressList(0, 1, "AccountID", rawTx.Account.AccountID)
+	addresses, _, err := wrapper.GetAddressList(false, 0, 1, "AccountID", rawTx.Account.AccountID)
 	if err != nil || len(addresses) == 0 {
 		return types.Errorf(types.ErrAddressNotFound, "no address for account")
 	}
@@ -69,10 +72,10 @@ func (d *EthTransactionDecoder) EstimateRawTransactionFee(wrapper wallet.WalletD
 	return nil
 }
 
-// CreateRawTransaction 创建原始交易（仅原生币；ERC20 可后续扩展）
+// CreateRawTransaction 创建原始交易（原生币或 ERC20）
 func (d *EthTransactionDecoder) CreateRawTransaction(wrapper wallet.WalletDAI, rawTx *types.RawTransaction) error {
 	if rawTx.Coin.IsContract {
-		return types.Errorf(types.ErrCreateRawTransactionFailed, "ERC20 not implemented in this adapter yet")
+		return d.createErc20RawTransaction(wrapper, rawTx)
 	}
 	return d.createSimpleRawTransaction(wrapper, rawTx, nil)
 }
@@ -82,13 +85,6 @@ func (d *EthTransactionDecoder) createSimpleRawTransaction(wrapper wallet.Wallet
 		return types.Errorf(types.ErrCreateRawTransactionFailed, "account is nil")
 	}
 	accountID := rawTx.Account.AccountID
-	addresses, err := wrapper.GetAddressList(0, -1, "AccountID", accountID)
-	if err != nil {
-		return types.NewError(types.ErrAddressNotFound, err.Error())
-	}
-	if len(addresses) == 0 {
-		return types.Errorf(types.ErrAddressNotFound, "account has no addresses")
-	}
 	var toAddr, amountStr string
 	for k, v := range rawTx.To {
 		toAddr = k
@@ -99,38 +95,143 @@ func (d *EthTransactionDecoder) createSimpleRawTransaction(wrapper wallet.Wallet
 	if err != nil {
 		return types.ConvertError(err)
 	}
-	searchAddrs := make([]string, len(addresses))
-	for i := range addresses {
-		searchAddrs[i] = addresses[i].Address
-	}
-	var findBalance *models.AddrBalance
-	for _, addr := range searchAddrs {
-		bal, err := d.Wm.GetAddrBalance(addr, "pending")
+
+	// 分页查询地址，每页内检查余额，找到足够余额的地址即返回，避免一次拉取全部
+	var lastID int64 = 0
+	for {
+		addresses, _, err := wrapper.GetAddressList(false, lastID, addressListPageSize, "AccountID", accountID)
 		if err != nil {
-			continue
+			return types.NewError(types.ErrAddressNotFound, err.Error())
 		}
-		feeInfo, err := d.Wm.GetTransactionFeeEstimated(addr, toAddr, amount, nil)
-		if err != nil {
-			continue
+		if len(addresses) == 0 {
+			if lastID == 0 {
+				return types.Errorf(types.ErrAddressNotFound, "account has no addresses")
+			}
+			break
 		}
-		total := new(big.Int).Add(amount, feeInfo.Fee)
-		if bal.Cmp(total) >= 0 {
-			findBalance = &models.AddrBalance{Address: addr, Balance: bal}
+		var findBalance *models.AddrBalance
+		for _, addr := range addresses {
+			bal, err := d.Wm.GetAddrBalance(addr.Address, "pending")
+			if err != nil {
+				continue
+			}
+			feeInfo, err := d.Wm.GetTransactionFeeEstimated(addr.Address, toAddr, amount, nil)
+			if err != nil {
+				continue
+			}
+			total := new(big.Int).Add(amount, feeInfo.Fee)
+			if bal.Cmp(total) >= 0 {
+				findBalance = &models.AddrBalance{Address: addr.Address, Balance: bal}
+				break
+			}
+		}
+		if findBalance != nil {
+			feeInfo, err := d.Wm.GetTransactionFeeEstimated(findBalance.Address, toAddr, amount, nil)
+			if err != nil {
+				return types.ConvertError(err)
+			}
+			if rawTx.FeeRate != "" {
+				feeInfo.GasPrice, _ = util.StringToBigInt(rawTx.FeeRate, d.Wm.SymbolDecimal())
+				feeInfo.CalcFee()
+			}
+			return d.buildRawTransaction(wrapper, rawTx, findBalance, feeInfo, "", tmpNonce)
+		}
+		if int64(len(addresses)) < addressListPageSize {
+			break
+		}
+		lastID = getLastAddressID(addresses)
+		if lastID <= 0 {
 			break
 		}
 	}
-	if findBalance == nil {
-		return types.Errorf(types.ErrInsufficientBalanceOfAccount, "insufficient balance for %s", amountStr)
+	return types.Errorf(types.ErrInsufficientBalanceOfAccount, "insufficient balance for %s", amountStr)
+}
+
+// getLastAddressID 取分页结果中最后一条的 ID 用于下一页 lastID；空列表返回 0
+func getLastAddressID(addresses []*types.Address) int64 {
+	if len(addresses) == 0 {
+		return 0
 	}
-	feeInfo, err := d.Wm.GetTransactionFeeEstimated(findBalance.Address, toAddr, amount, nil)
+	return addresses[len(addresses)-1].ID
+}
+
+// createErc20RawTransaction 创建 ERC20 转账原始交易：分页查地址，选代币余额与原生余额均足够的地址，编码 transfer(to, amount) 后建单
+func (d *EthTransactionDecoder) createErc20RawTransaction(wrapper wallet.WalletDAI, rawTx *types.RawTransaction) error {
+	if rawTx.Account == nil {
+		return types.Errorf(types.ErrCreateRawTransactionFailed, "account is nil")
+	}
+	contractAddr := rawTx.Coin.Contract.Address
+	if contractAddr == "" {
+		return types.Errorf(types.ErrCreateRawTransactionFailed, "contract address is empty")
+	}
+	tokenDecimals := int32(rawTx.Coin.Contract.Decimals)
+	var toAddr, amountStr string
+	for k, v := range rawTx.To {
+		toAddr = k
+		amountStr = v
+		break
+	}
+	amount, err := util.StringToBigInt(amountStr, tokenDecimals)
 	if err != nil {
 		return types.ConvertError(err)
 	}
-	if rawTx.FeeRate != "" {
-		feeInfo.GasPrice, _ = util.StringToBigInt(rawTx.FeeRate, d.Wm.SymbolDecimal())
-		feeInfo.CalcFee()
+
+	lastID := int64(0)
+	var errTokenBalance, errBalance string
+	for {
+		addresses, _, err := wrapper.GetAddressList(false, lastID, addressListPageSize, "AccountID", rawTx.Account.AccountID)
+		if err != nil {
+			return types.NewError(types.ErrAddressNotFound, err.Error())
+		}
+		if len(addresses) == 0 {
+			if lastID == 0 {
+				return types.Errorf(types.ErrAddressNotFound, "account has no addresses")
+			}
+			break
+		}
+		for _, addr := range addresses {
+			tokenBal, err := d.Wm.ERC20BalanceOf(contractAddr, addr.Address)
+			if err != nil || tokenBal == nil || tokenBal.Cmp(amount) < 0 {
+				if err == nil && tokenBal != nil {
+					errTokenBalance = "the token balance of all addresses is not enough"
+				}
+				continue
+			}
+			data, err := d.Wm.EncodeERC20Transfer(toAddr, amount)
+			if err != nil {
+				continue
+			}
+			feeInfo, err := d.Wm.GetTransactionFeeEstimated(addr.Address, contractAddr, nil, data)
+			if err != nil {
+				continue
+			}
+			if rawTx.FeeRate != "" {
+				feeInfo.GasPrice, _ = util.StringToBigInt(rawTx.FeeRate, d.Wm.SymbolDecimal())
+				feeInfo.CalcFee()
+			}
+			nativeBal, err := d.Wm.GetAddrBalance(addr.Address, "pending")
+			if err != nil || nativeBal == nil || nativeBal.Cmp(feeInfo.Fee) < 0 {
+				errBalance = "native balance not enough to pay gas"
+				continue
+			}
+			ab := &models.AddrBalance{Address: addr.Address, Balance: nativeBal, TokenBalance: tokenBal}
+			return d.buildRawTransaction(wrapper, rawTx, ab, feeInfo, hex.EncodeToString(data), nil)
+		}
+		if int64(len(addresses)) < addressListPageSize {
+			break
+		}
+		lastID = getLastAddressID(addresses)
+		if lastID <= 0 {
+			break
+		}
 	}
-	return d.buildRawTransaction(wrapper, rawTx, findBalance, feeInfo, "", tmpNonce)
+	if errTokenBalance != "" {
+		return types.Errorf(types.ErrInsufficientTokenBalanceOfAddress, errTokenBalance)
+	}
+	if errBalance != "" {
+		return types.Errorf(types.ErrInsufficientFees, errBalance)
+	}
+	return types.Errorf(types.ErrInsufficientBalanceOfAccount, "insufficient token or native balance for %s", amountStr)
 }
 
 func (d *EthTransactionDecoder) buildRawTransaction(wrapper wallet.WalletDAI, rawTx *types.RawTransaction, ab *models.AddrBalance, fee *models.TxFeeInfo, callData string, tmpNonce *uint64) error {
@@ -335,7 +436,7 @@ func normalizeMPCSignatureForEthereum(pubHex, msgHex, sigHex string) (string, er
 	return "0x" + hex.EncodeToString(finalSig), nil
 }
 
-// CreateSummaryRawTransactionWithError 汇总交易（仅原生币）
+// CreateSummaryRawTransactionWithError 汇总交易（仅原生币）；分页查询地址，对满足条件的地址逐个构建汇总交易
 func (d *EthTransactionDecoder) CreateSummaryRawTransactionWithError(wrapper wallet.WalletDAI, sumRawTx *types.SummaryRawTransaction) ([]*types.RawTransactionWithError, error) {
 	if sumRawTx.Coin.IsContract {
 		return nil, types.Errorf(types.ErrCreateRawTransactionFailed, "ERC20 summary not implemented yet")
@@ -345,39 +446,63 @@ func (d *EthTransactionDecoder) CreateSummaryRawTransactionWithError(wrapper wal
 	if minTransfer.Cmp(retainedBalance) < 0 {
 		return nil, types.Errorf(types.ErrCreateRawTransactionFailed, "minTransfer must be >= retainedBalance")
 	}
-	addresses, err := wrapper.GetAddressList(int64(sumRawTx.AddressStartIndex), sumRawTx.AddressLimit, "AccountID", sumRawTx.Account.AccountID)
-	if err != nil {
-		return nil, err
-	}
-	if len(addresses) == 0 {
-		return nil, types.Errorf(types.ErrAddressNotFound, "no addresses")
-	}
+
 	var result []*types.RawTransactionWithError
-	for _, addr := range addresses {
-		bal, err := d.Wm.GetAddrBalance(addr.Address, "pending")
-		if err != nil || bal.Cmp(minTransfer) < 0 {
-			continue
-		}
-		sumAmount := new(big.Int).Sub(bal, retainedBalance)
-		sumAmount.Sub(sumAmount, big.NewInt(0))
-		feeInfo, err := d.Wm.GetTransactionFeeEstimated(addr.Address, sumRawTx.SummaryAddress, sumAmount, nil)
+	lastID := sumRawTx.AddressStartIndex
+	pageSize := addressListPageSize
+	if sumRawTx.AddressLimit > 0 && sumRawTx.AddressLimit < pageSize {
+		pageSize = sumRawTx.AddressLimit
+	}
+	processedCount := int64(0)
+
+	for {
+		addresses, _, err := wrapper.GetAddressList(false, lastID, pageSize, "AccountID", sumRawTx.Account.AccountID)
 		if err != nil {
-			result = append(result, &types.RawTransactionWithError{RawTx: nil, Error: types.ConvertError(err)})
-			continue
+			return nil, err
 		}
-		sumAmount.Sub(sumAmount, feeInfo.Fee)
-		if sumAmount.Sign() <= 0 {
-			continue
+		if len(addresses) == 0 {
+			if lastID == sumRawTx.AddressStartIndex {
+				return nil, types.Errorf(types.ErrAddressNotFound, "no addresses")
+			}
+			break
 		}
-		rawTx := &types.RawTransaction{
-			Coin:     sumRawTx.Coin,
-			Account:  sumRawTx.Account,
-			To:       map[string]string{sumRawTx.SummaryAddress: util.BigIntToDecimal(sumAmount, d.Wm.SymbolDecimal())},
-			Required: 1,
+		for _, addr := range addresses {
+			if sumRawTx.AddressLimit > 0 && processedCount >= sumRawTx.AddressLimit {
+				return result, nil
+			}
+			processedCount++
+			bal, err := d.Wm.GetAddrBalance(addr.Address, "pending")
+			if err != nil || bal.Cmp(minTransfer) < 0 {
+				continue
+			}
+			sumAmount := new(big.Int).Sub(bal, retainedBalance)
+			sumAmount.Sub(sumAmount, big.NewInt(0))
+			feeInfo, err := d.Wm.GetTransactionFeeEstimated(addr.Address, sumRawTx.SummaryAddress, sumAmount, nil)
+			if err != nil {
+				result = append(result, &types.RawTransactionWithError{RawTx: nil, Error: types.ConvertError(err)})
+				continue
+			}
+			sumAmount.Sub(sumAmount, feeInfo.Fee)
+			if sumAmount.Sign() <= 0 {
+				continue
+			}
+			rawTx := &types.RawTransaction{
+				Coin:     sumRawTx.Coin,
+				Account:  sumRawTx.Account,
+				To:       map[string]string{sumRawTx.SummaryAddress: util.BigIntToDecimal(sumAmount, d.Wm.SymbolDecimal())},
+				Required: 1,
+			}
+			ab := &models.AddrBalance{Address: addr.Address, Balance: bal}
+			err = d.buildRawTransaction(wrapper, rawTx, ab, feeInfo, "", nil)
+			result = append(result, &types.RawTransactionWithError{RawTx: rawTx, Error: types.ConvertError(err)})
 		}
-		ab := &models.AddrBalance{Address: addr.Address, Balance: bal}
-		err = d.buildRawTransaction(wrapper, rawTx, ab, feeInfo, "", nil)
-		result = append(result, &types.RawTransactionWithError{RawTx: rawTx, Error: types.ConvertError(err)})
+		if int64(len(addresses)) < pageSize {
+			break
+		}
+		lastID = getLastAddressID(addresses)
+		if lastID <= 0 {
+			break
+		}
 	}
 	return result, nil
 }

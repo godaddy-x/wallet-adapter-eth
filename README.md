@@ -140,6 +140,7 @@ func registerEvmChains() {
 | 能力 | 说明 |
 |------|------|
 | 原生 ETH 转账 | CreateRawTransaction / SubmitRawTransaction / VerifyRawTransaction |
+| ERC20 转账 | CreateRawTransaction（IsContract 时建 transfer 单）/ SubmitRawTransaction / VerifyRawTransaction |
 | 费率 | GetRawTransactionFeeRate、EstimateRawTransactionFee |
 | 汇总 | CreateSummaryRawTransactionWithError（仅原生币） |
 | 地址 | AddressDecode / AddressEncode / AddressVerify、PublicKeyToAddress（EVM 0x+20 字节） |
