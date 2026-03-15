@@ -17,12 +17,13 @@ import (
 // EthAdapter 实现 wallet-adapter 的 ChainAdapter，用于 ETH 及 EVM 兼容链（BSC、Polygon、Arbitrum 等）
 type EthAdapter struct {
 	chain.ChainAdapterBase
-	wm       *manager.WalletManager
-	txDec    *decoder.EthTransactionDecoder
-	addrDec  *decoder.EthAddressDecoder
-	symbol   string
-	fullName string
-	decimals int32
+	wm         *manager.WalletManager
+	txDec      *decoder.EthTransactionDecoder
+	addrDec    *decoder.EthAddressDecoder
+	contractDec *decoder.EthSmartContractDecoder
+	symbol     string
+	fullName   string
+	decimals   int32
 }
 
 // NewEthAdapter 创建以太坊链适配器（仅设 symbol/fullName/decimals，Config 与 RPC 客户端由 LoadAssetsConfig 回调初始化，与 quorum 用法一致）
@@ -31,13 +32,15 @@ func NewEthAdapter(symbol, fullName string, decimals int32) *EthAdapter {
 	wm := &manager.WalletManager{Config: cfg, Client: nil}
 	txDec := decoder.NewTransactionDecoder(wm)
 	addrDec := decoder.DefaultDecoder
+	contractDec := decoder.NewSmartContractDecoder(wm)
 	return &EthAdapter{
-		wm:       wm,
-		txDec:    txDec,
-		addrDec:  addrDec,
-		symbol:   symbol,
-		fullName: fullName,
-		decimals: decimals,
+		wm:          wm,
+		txDec:       txDec,
+		addrDec:     addrDec,
+		contractDec: contractDec,
+		symbol:      symbol,
+		fullName:    fullName,
+		decimals:    decimals,
 	}
 }
 
@@ -82,6 +85,11 @@ func (a *EthAdapter) GetBlockScanner() scanner.BlockScanner {
 // GetAddressDecoder 返回地址解码器
 func (a *EthAdapter) GetAddressDecoder() adapter.AddressDecoder {
 	return a.addrDec
+}
+
+// GetSmartContractDecoder 返回智能合约解码器（ERC20 代币余额与元数据；Call/Create/Submit 暂未实现）
+func (a *EthAdapter) GetSmartContractDecoder() adapter.SmartContractDecoder {
+	return a.contractDec
 }
 
 // LoadAssetsConfig 从外部配置回调加载并应用参数（如 serverAPI、broadcastAPI、chainID、gas、nonce 策略等）。
