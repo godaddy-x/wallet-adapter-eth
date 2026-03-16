@@ -27,20 +27,27 @@ func NewSmartContractDecoder(wm *manager.WalletManager) *EthSmartContractDecoder
 }
 
 // GetTokenBalanceByAddress 查询地址代币余额列表（ERC20 balanceOf）
+// 所有地址都查询失败时返回错误，部分成功时只返回成功的余额。
 func (d *EthSmartContractDecoder) GetTokenBalanceByAddress(contract types.SmartContract, address ...string) ([]*types.TokenBalance, error) {
 	if d.Wm == nil || d.Wm.Client == nil {
 		return nil, fmt.Errorf("wallet manager or client is nil")
 	}
+	if len(address) == 0 {
+		return []*types.TokenBalance{}, nil
+	}
+
 	contractAddr := util.Append0x(contract.Address)
 	decimals := int32(contract.Decimals)
 	if decimals < 0 {
 		decimals = 18
 	}
+
 	result := make([]*types.TokenBalance, 0, len(address))
 	for _, addr := range address {
 		bal, err := d.Wm.ERC20BalanceOf(contractAddr, addr)
 		if err != nil {
-			continue
+			// 直接返回底层错误，方便定位问题
+			return nil, fmt.Errorf("erc20 balanceOf %s on %s failed: %w", addr, contractAddr, err)
 		}
 		bStr := util.BigIntToDecimal(bal, decimals)
 		tb := &types.TokenBalance{
@@ -55,6 +62,7 @@ func (d *EthSmartContractDecoder) GetTokenBalanceByAddress(contract types.SmartC
 		}
 		result = append(result, tb)
 	}
+
 	return result, nil
 }
 

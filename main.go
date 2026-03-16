@@ -2,14 +2,14 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"os"
-	"os/signal"
 
 	"github.com/godaddy-x/wallet-adapter-eth/eth"
 	"github.com/godaddy-x/wallet-adapter/chain"
+	"github.com/godaddy-x/wallet-adapter/types"
 )
 
 var (
@@ -60,10 +60,32 @@ func main() {
 		} else {
 			fmt.Printf("地址 %s nonce: %d\n", *testAddr, nonce)
 		}
+		balance, err := adapter.GetAddrBalance(*testAddr, "latest")
+		if err != nil {
+			log.Printf("GetAddrBalance(%s): %v", *testAddr, err)
+			return
+		}
+		fmt.Println("balance:", balance.String())
+
+		meta, err := adapter.GetSmartContractDecoder().GetTokenMetadata("0x83fe83f9a6bb675d4ad6dcf425a54e4cb5824aae")
+		if err != nil {
+			log.Printf("GetSmartContractDecoder().GetTokenMetadata(%s): %v", *testAddr, err)
+			return
+		}
+
+		fmt.Println(meta)
+
+		tokenBalance, err := adapter.GetSmartContractDecoder().GetTokenBalanceByAddress(types.SmartContract{Address: "0x83fe83f9a6bb675d4ad6dcf425a54e4cb5824aae"}, "0x669a741db0238d0c4d0da750b3a01fdb7087364a")
+		if err != nil {
+			log.Printf("GetAddrBalance(%s): %v", *testAddr, err)
+			return
+		}
+		a, _ := json.Marshal(tokenBalance)
+		fmt.Println("token balance:", string(a))
 	}
 
-	fmt.Println("--- 进程阻塞运行中 (Ctrl+C 退出) ---")
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-	<-sig
+	//fmt.Println("--- 进程阻塞运行中 (Ctrl+C 退出) ---")
+	//sig := make(chan os.Signal, 1)
+	//signal.Notify(sig, os.Interrupt)
+	//<-sig
 }

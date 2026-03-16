@@ -106,5 +106,11 @@ func (wm *WalletManager) ERC20BalanceOf(contractAddr, accountAddr string) (*big.
 	if !strings.HasPrefix(result, "0x") {
 		result = "0x" + result
 	}
-	return hexutil.DecodeBig(result)
+
+	// balanceOf 返回的是 ABI 编码的 uint256，需要按 bytes 解析，而不是 JSON quantity（避免 leading zero 报错）
+	out, decErr := hexutil.Decode(result)
+	if decErr != nil {
+		return nil, decErr
+	}
+	return new(big.Int).SetBytes(out), nil
 }
