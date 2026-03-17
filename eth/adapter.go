@@ -4,12 +4,13 @@ import (
 	"math/big"
 
 	adapter "github.com/godaddy-x/wallet-adapter"
-	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/config"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/decoder"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/manager"
+	ethscanner "github.com/godaddy-x/wallet-adapter-eth/internal/scanner"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/rpc"
 	"github.com/godaddy-x/wallet-adapter/chain"
+	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
 	"github.com/godaddy-x/wallet-adapter/scanner"
 	"github.com/godaddy-x/wallet-adapter/types"
 )
@@ -17,27 +18,31 @@ import (
 // EthAdapter 实现 github.com/godaddy-x/wallet-adapter 的 ChainAdapter，用于 ETH 及 EVM 兼容链（BSC、Polygon、Arbitrum 等）
 type EthAdapter struct {
 	chain.ChainAdapterBase
-	wm         *manager.WalletManager
-	txDec      *decoder.EthTransactionDecoder
-	addrDec    *decoder.EthAddressDecoder
+	wm          *manager.WalletManager
+	txDec       *decoder.EthTransactionDecoder
+	addrDec     *decoder.EthAddressDecoder
 	contractDec *decoder.EthSmartContractDecoder
-	symbol     string
-	fullName   string
-	decimals   int32
+	blockScan   scanner.BlockScanner
+	symbol      string
+	fullName    string
+	decimals    int32
 }
 
-// NewEthAdapter 创建以太坊链适配器（仅设 symbol/fullName/decimals，Config 与 RPC 客户端由 LoadAssetsConfig 回调初始化，与 quorum 用法一致）
+// NewEthAdapter 创建以太坊链适配器（仅设 symbol/fullName/decimals，Config 与 RPC 客户端由 LoadAssetsConfig 回调初始化）。
+// TokenMetadataFunc 现由外部在 scanner.Base 层统一注入（与 ScanTargetFunc 一致），此处仅负责构造 EthBlockScanner。
 func NewEthAdapter(symbol, fullName string, decimals int32) *EthAdapter {
 	cfg := config.NewConfig(symbol)
 	wm := &manager.WalletManager{Config: cfg, Client: nil}
 	txDec := decoder.NewTransactionDecoder(wm)
 	addrDec := decoder.DefaultDecoder
 	contractDec := decoder.NewSmartContractDecoder(wm)
+	blockScan := ethscanner.NewBlockScanner(wm)
 	return &EthAdapter{
 		wm:          wm,
 		txDec:       txDec,
 		addrDec:     addrDec,
 		contractDec: contractDec,
+		blockScan:   blockScan,
 		symbol:      symbol,
 		fullName:    fullName,
 		decimals:    decimals,
@@ -77,9 +82,8 @@ func (a *EthAdapter) GetTransactionDecoder() adapter.TransactionDecoder {
 	return a.txDec
 }
 
-// GetBlockScanner 暂不实现扫块，返回 nil
 func (a *EthAdapter) GetBlockScanner() scanner.BlockScanner {
-	return nil
+	return a.blockScan
 }
 
 // GetAddressDecoder 返回地址解码器
@@ -118,7 +122,6 @@ func (a *EthAdapter) SetClient(client *rpc.Client) {
 	a.wm.Client = client
 }
 
-// Config 返回链配置（即 wm.Config）
 // Config 返回链配置（即 wm.Config）
 func (a *EthAdapter) Config() *config.WalletConfig {
 	return a.wm.Config

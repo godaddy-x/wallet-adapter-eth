@@ -20,7 +20,7 @@ type WalletManager struct {
 	Config *config.WalletConfig
 }
 
-// LoadAssetsConfig 从 github.com/godaddy-x/wallet-adapter 的 Configer 回调加载并应用配置，初始化 RPC 客户端（与 quorum-adapter 用法一致）。
+// LoadAssetsConfig 从 github.com/godaddy-x/wallet-adapter 的 Configer 回调加载并应用配置，初始化 RPC 客户端。
 // 会更新 Config、创建数据目录、Dial 并设置 Client；若未配置 chainID 则从节点拉取。
 func (wm *WalletManager) LoadAssetsConfig(c adapterconfig.Configer) error {
 	symbol := "ETH"

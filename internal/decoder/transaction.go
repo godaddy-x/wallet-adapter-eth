@@ -9,18 +9,17 @@ import (
 	"strconv"
 	"strings"
 
+	ethcom "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/manager"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/models"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/util"
 	"github.com/godaddy-x/wallet-adapter/decoder"
 	"github.com/godaddy-x/wallet-adapter/types"
 	"github.com/godaddy-x/wallet-adapter/wallet"
-	ethcom "github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	ethtypes "github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/tidwall/gjson"
 )
 
 // EthTransactionDecoder 实现 decoder.TransactionDecoder（EVM 原生 + 可选 ERC20）
@@ -256,10 +255,10 @@ func (d *EthTransactionDecoder) createErc20RawTransaction(wrapper wallet.WalletD
 		}
 	}
 	if errTokenBalance != "" {
-		return types.Errorf(types.ErrInsufficientTokenBalanceOfAddress, errTokenBalance)
+		return types.Errorf(types.ErrInsufficientTokenBalanceOfAddress, "%s", errTokenBalance)
 	}
 	if errBalance != "" {
-		return types.Errorf(types.ErrInsufficientFees, errBalance)
+		return types.Errorf(types.ErrInsufficientFees, "%s", errBalance)
 	}
 	return types.Errorf(types.ErrInsufficientBalanceOfAccount, "insufficient token or native balance for %s", amountStr)
 }
@@ -285,9 +284,11 @@ func (d *EthTransactionDecoder) buildRawTransaction(wrapper wallet.WalletDAI, ra
 	if tmpNonce != nil {
 		nonce = *tmpNonce
 	} else {
-		if rawTx.ExtParam != "" {
-			if n := gjson.Get(rawTx.ExtParam, "nonce"); n.Exists() {
-				nonce = n.Uint()
+		if rawTx.ExtParam != nil {
+			if n, ok := rawTx.ExtParam["nonce"]; ok {
+				if parsed, perr := strconv.ParseUint(n, 10, 64); perr == nil {
+					nonce = parsed
+				}
 			}
 		}
 		if nonce == 0 {
@@ -468,7 +469,7 @@ func normalizeMPCSignatureForEthereum(pubHex, msgHex, sigHex string) (string, er
 
 // CreateSummaryRawTransactionWithError 汇总交易；分页查询地址，对满足条件的地址逐个构建汇总交易。
 // - 原生币：直接基于地址原生余额汇总；
-// - ERC20：基于合约代币余额汇总，参考 quorum-adapter 的 CreateErc20TokenSummaryRawTransaction。
+// - ERC20：基于合约代币余额汇总。
 func (d *EthTransactionDecoder) CreateSummaryRawTransactionWithError(wrapper wallet.WalletDAI, sumRawTx *types.SummaryRawTransaction) ([]*types.RawTransactionWithError, error) {
 	if sumRawTx.Coin.IsContract {
 		return d.createErc20SummaryRawTransaction(wrapper, sumRawTx)
@@ -582,7 +583,7 @@ func (d *EthTransactionDecoder) createNativeSummaryRawTransaction(wrapper wallet
 // 4. 使用 EncodeERC20Transfer(summaryAddress, sumAmount) 生成 transfer 调用 data，并估算主币手续费；
 // 5. 若主币余额足以支付手续费，则通过 buildRawTransaction 构造一笔 ERC20 汇总交易（to=合约地址，value=0，data=transfer）；
 // 6. 每个地址的构建结果（成功/失败）都会以 RawTransactionWithError 形式返回，调用方可逐条处理。
-// 这样在地址规模较大时仍能保持可控的内存与 RPC 次数，同时保证与 quorum-adapter 的 ERC20 汇总语义基本一致。
+// 这样在地址规模较大时仍能保持可控的内存与 RPC 次数，同时保证 ERC20 汇总语义清晰可靠。
 func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.WalletDAI, sumRawTx *types.SummaryRawTransaction) ([]*types.RawTransactionWithError, error) {
 	if sumRawTx.Account == nil {
 		return nil, types.Errorf(types.ErrCreateRawTransactionFailed, "account is nil")

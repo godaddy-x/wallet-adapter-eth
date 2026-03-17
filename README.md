@@ -2,7 +2,7 @@
 
 **模块路径**：`github.com/godaddy-x/wallet-adapter-eth`
 
-以太坊及 EVM 兼容链的 [wallet-adapter](https://github.com/godaddy-x/wallet-adapter) 子类实现，为 BSC、Polygon、Arbitrum 等提供统一 ChainAdapter。支持原生币与 ERC20 建单、EIP-155 签名、原始交易广播，可与外部 MPC 签名服务配合使用；配置通过 LoadAssetsConfig 回调或 INI 注入，与 quorum-adapter 用法一致。
+以太坊及 EVM 兼容链的 [wallet-adapter](https://github.com/godaddy-x/wallet-adapter) 子类实现，为 BSC、Polygon、Arbitrum 等提供统一 ChainAdapter。支持原生币与 ERC20 建单、EIP-155 签名、原始交易广播，可与外部 MPC 签名服务配合使用；配置通过 LoadAssetsConfig 回调或 INI 注入。
 
 ## 概述
 
