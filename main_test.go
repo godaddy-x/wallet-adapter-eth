@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,14 +16,9 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// TestStartBlockScanner 演示如何在业务侧完整初始化适配器和扫块器：
-// - 通过 eth.NewAdapter 创建适配器（内部构造 EthBlockScanner）；
-// - 设置 ScanTargetFunc：告诉扫块器“哪些地址/合约是我关心的扫描目标”（本用例不关心交易提取，因此默认都不匹配）；
-// - 设置 TokenMetadataFunc（在 Base 上，由外部业务注入）：提供代币精度等元数据（本用例返回 nil，回退链上元数据查询）；
-// - 实际连本地节点：获取 latest 区块头并执行一次 ScanBlock，验证扫块流程可跑通。
-func TestStartBlockScanner(t *testing.T) {
-	// 复用 main.go 中的 demo 配置（本地节点地址可按需要调整）
-	const iniContent = `[ETH]
+// testIniContent 为本仓库本地节点集成测试的通用配置。
+// 如需切换节点端口/数据目录，只需修改此处。
+const testIniContent = `[ETH]
 serverAPI = http://127.0.0.1:8547
 broadcastAPI = http://127.0.0.1:8547
 fixGasLimit =
@@ -35,6 +31,17 @@ detectUnknownContracts = 0
 moralisAPIKey =
 moralisAPIChain = eth
 useMoralisAPIParseBlock = 0`
+
+const testHeight = 83156
+
+// TestStartBlockScanner 演示如何在业务侧完整初始化适配器和扫块器：
+// - 通过 eth.NewAdapter 创建适配器（内部构造 EthBlockScanner）；
+// - 设置 ScanTargetFunc：告诉扫块器“哪些地址/合约是我关心的扫描目标”（本用例不关心交易提取，因此默认都不匹配）；
+// - 设置 TokenMetadataFunc（在 Base 上，由外部业务注入）：提供代币精度等元数据（本用例返回 nil，回退链上元数据查询）；
+// - 实际连本地节点：获取 latest 区块头并执行一次 ScanBlock，验证扫块流程可跑通。
+func TestStartBlockScanner(t *testing.T) {
+	// 复用 main.go 中的 demo 配置（本地节点地址可按需要调整）
+	const iniContent = testIniContent
 
 	// 创建适配器（内部会构造 EthBlockScanner，但此时尚未设置 ScanTargetFunc 与 TokenMetadataFunc）
 	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
@@ -51,7 +58,7 @@ useMoralisAPIParseBlock = 0`
 
 	// 1）设置 ScanTargetFunc：本用例不关心交易提取，因此全部返回 Exist=false
 	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) types.ScanTargetResult {
-		return types.ScanTargetResult{Exist: true}
+		return types.ScanTargetResult{SourceKey: "test", Exist: true}
 	})
 
 	// 2）设置 TokenMetadataFunc：本用例返回 nil，表示业务侧不做兜底配置，回退链上 ERC20Metadata（若链上也查不到则会跳过该事件）
@@ -70,7 +77,7 @@ useMoralisAPIParseBlock = 0`
 		t.Fatalf("invalid header: %+v", header)
 	}
 
-	res, err := rawScanner.ScanBlockWithResult(83156)
+	res, err := rawScanner.ScanBlockWithResult(testHeight)
 	if err != nil {
 		t.Fatalf("ScanBlockWithResult(%d) error: %v", header.Height, err)
 	}
@@ -84,19 +91,7 @@ useMoralisAPIParseBlock = 0`
 // TestScanBlockWithResultFlow 验证 ScanBlockWithResult 的同步扫块流程与块内并行提取逻辑可正常工作。
 // 该用例依赖本地节点可用（使用与 TestStartBlockScanner 相同的 INI 配置）。
 func TestScanBlockWithResultFlow(t *testing.T) {
-	const iniContent = `[ETH]
-serverAPI = http://127.0.0.1:8547
-broadcastAPI = http://127.0.0.1:8547
-fixGasLimit =
-dataDir = E://test/
-fixGasPrice =
-offsetsGasPrice = 0
-nonceComputeMode = 0
-useQNSingleFlightRPC = 0
-detectUnknownContracts = 0
-moralisAPIKey =
-moralisAPIChain = eth
-useMoralisAPIParseBlock = 0`
+	const iniContent = testIniContent
 
 	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
 	if err != nil {
@@ -156,19 +151,7 @@ useMoralisAPIParseBlock = 0`
 
 // TestVerifyTransactionByTxID 从 latest 区块取一笔 tx 进行链上复核，验证 VerifyTransactionByTxID 可跑通并返回结果集结构。
 func TestVerifyTransactionByTxID(t *testing.T) {
-	const iniContent = `[ETH]
-serverAPI = http://127.0.0.1:8547
-broadcastAPI = http://127.0.0.1:8547
-fixGasLimit =
-dataDir = E://test/
-fixGasPrice =
-offsetsGasPrice = 0
-nonceComputeMode = 0
-useQNSingleFlightRPC = 0
-detectUnknownContracts = 0
-moralisAPIKey =
-moralisAPIChain = eth
-useMoralisAPIParseBlock = 0`
+	const iniContent = testIniContent
 
 	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
 	if err != nil {
@@ -230,19 +213,7 @@ useMoralisAPIParseBlock = 0`
 }
 
 func TestVerifyTransactionMatch(t *testing.T) {
-	const iniContent = `[ETH]
-serverAPI = http://127.0.0.1:8547
-broadcastAPI = http://127.0.0.1:8547
-fixGasLimit =
-dataDir = E://test/
-fixGasPrice =
-offsetsGasPrice = 0
-nonceComputeMode = 0
-useQNSingleFlightRPC = 0
-detectUnknownContracts = 0
-moralisAPIKey =
-moralisAPIChain = eth
-useMoralisAPIParseBlock = 0`
+	const iniContent = testIniContent
 
 	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
 	if err != nil {
@@ -353,4 +324,110 @@ found:
 		t.Fatalf("nil match result")
 	}
 	t.Logf("match verified=%v reason=%q mismatches=%v", mr.Verified, mr.Reason, mr.Mismatches)
+}
+
+// TestScanBlockOnce 测试“指定高度补扫一次”的能力（不进入持续循环）。
+func TestScanBlockOnce(t *testing.T) {
+	const iniContent = testIniContent
+
+	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	if err != nil {
+		t.Fatalf("NewAdapter error: %v", err)
+	}
+	rawScanner := adapter.GetBlockScanner()
+	bs, ok := rawScanner.(*ethscanner.EthBlockScanner)
+	if !ok {
+		t.Fatalf("unexpected BlockScanner type: %T", rawScanner)
+	}
+
+	// 全命中，确保能产出结果集（若本地节点对应高度无交易也可正常返回）。
+	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) types.ScanTargetResult {
+		return types.ScanTargetResult{Exist: true, SourceKey: "test"}
+	})
+	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
+
+	start := time.Now()
+	res, err := rawScanner.ScanBlockOnce(uint64(testHeight))
+	if err != nil {
+		t.Fatalf("ScanBlockOnce(%d) error: %v", testHeight, err)
+	}
+	if res == nil {
+		t.Fatalf("nil ScanBlockOnce result")
+	}
+	if res.Height != uint64(testHeight) {
+		t.Fatalf("unexpected height: got=%d want=%d", res.Height, testHeight)
+	}
+	if res.Header == nil {
+		t.Fatalf("nil header in result: %+v", res)
+	}
+	if res.Header.Height != uint64(testHeight) {
+		t.Fatalf("unexpected header.height: got=%d want=%d", res.Header.Height, testHeight)
+	}
+	if res.BlockHash == "" || res.Header.Hash == "" || res.Header.Hash != res.BlockHash {
+		t.Fatalf("unexpected block hash/header hash: blockHash=%q headerHash=%q", res.BlockHash, func() string {
+			if res.Header == nil {
+				return ""
+			}
+			return res.Header.Hash
+		}())
+	}
+
+	t.Logf("ScanBlockOnce ok: height=%d latest=%d conf=%d success=%v err=%q txTotal=%d txFailed=%d extracted=%d elapsed=%s",
+		res.Height, res.NetworkBlockHeight, res.Header.Confirmations, res.Success, res.ErrorReason,
+		res.TxTotal, res.TxFailed, res.ExtractedTxs, time.Since(start))
+}
+
+func TestRunScanLoopContinuously(t *testing.T) {
+	adapter, err := eth.NewAdapter(testIniContent, "ETH", "Ethereum", 18)
+	if err != nil {
+		t.Fatalf("NewAdapter error: %v", err)
+	}
+	rawScanner := adapter.GetBlockScanner()
+
+	// 让扫块器真正运行提取逻辑（可根据本地节点情况调整）。
+	_ = rawScanner.SetBlockScanTargetFunc(func(target types.ScanTargetParam) types.ScanTargetResult {
+		return types.ScanTargetResult{Exist: true, SourceKey: "test"}
+	})
+	_ = rawScanner.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
+
+	latest := rawScanner.GetGlobalMaxBlockHeight()
+	if latest < 2 {
+		t.Skipf("latest block height too small: %d", latest)
+	}
+
+	// confirmations 用于确定安全高度 safeTo=latest-confirmations。
+	// 本次观察将确认数设为 6，并使 windowSize=6，保证在追平 latest 后会持续循环覆盖最近 6 个安全块。
+	var confirmations uint64 = 6
+	var windowSize uint64 = 0
+	startHeight := testHeight
+
+	go func() {
+		if err := rawScanner.RunScanLoop(uint64(startHeight), confirmations, windowSize, 5*time.Second, func(res *types.BlockScanResult) {
+			if res == nil {
+				fmt.Printf("[RunScanLoop] nil result\n")
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			latestMax := rawScanner.GetGlobalMaxBlockHeight()
+			headerHash := ""
+			prevHash := ""
+			if res.Header != nil {
+				headerHash = res.Header.Hash
+				prevHash = res.Header.Previousblockhash
+			}
+			fmt.Printf("[RunScanLoop] scanHeight=%d latestMax=%d hash=%s header=%s prev=%s success=%v err=%q txTotal=%d txFailed=%d extracted=%d\n",
+				res.Height, latestMax, res.BlockHash, headerHash, prevHash, res.Success, res.ErrorReason,
+				res.TxTotal, res.TxFailed, res.ExtractedTxs)
+		}); err != nil {
+			fmt.Printf("[RunScanLoop] error: %v\n", err)
+		}
+	}()
+
+	time.Sleep(5 * time.Second)
+	t.Log("重置高度----")
+	rawScanner.ResetScanHeight(testHeight)
+
+	t.Logf("RunScanLoop started: latest=%d startHeight=%d confirmations=%d windowSize=%d, running ~10 minutes...",
+		latest, startHeight, confirmations, windowSize)
+	time.Sleep(10 * time.Minute)
 }
