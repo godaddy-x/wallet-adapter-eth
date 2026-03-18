@@ -33,6 +33,7 @@ moralisAPIChain = eth
 useMoralisAPIParseBlock = 0`
 
 const testHeight = 83156
+const testHeightToken = 88356
 
 // TestStartBlockScanner 演示如何在业务侧完整初始化适配器和扫块器：
 // - 通过 eth.NewAdapter 创建适配器（内部构造 EthBlockScanner）；
@@ -342,7 +343,10 @@ func TestScanBlockOnce(t *testing.T) {
 
 	// 全命中，确保能产出结果集（若本地节点对应高度无交易也可正常返回）。
 	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) types.ScanTargetResult {
-		return types.ScanTargetResult{Exist: true, SourceKey: "test"}
+		if target.ScanTarget == "0x301db155664284b1462e1a10c082a9ff6e2b617f" {
+			return types.ScanTargetResult{Exist: true, SourceKey: "test1"}
+		}
+		return types.ScanTargetResult{Exist: true, SourceKey: "test2"}
 	})
 	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
 
@@ -351,6 +355,8 @@ func TestScanBlockOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanBlockOnce(%d) error: %v", testHeight, err)
 	}
+	a, _ := json.Marshal(res)
+	fmt.Println(string(a))
 	if res == nil {
 		t.Fatalf("nil ScanBlockOnce result")
 	}
@@ -362,6 +368,62 @@ func TestScanBlockOnce(t *testing.T) {
 	}
 	if res.Header.Height != uint64(testHeight) {
 		t.Fatalf("unexpected header.height: got=%d want=%d", res.Header.Height, testHeight)
+	}
+	if res.BlockHash == "" || res.Header.Hash == "" || res.Header.Hash != res.BlockHash {
+		t.Fatalf("unexpected block hash/header hash: blockHash=%q headerHash=%q", res.BlockHash, func() string {
+			if res.Header == nil {
+				return ""
+			}
+			return res.Header.Hash
+		}())
+	}
+
+	t.Logf("ScanBlockOnce ok: height=%d latest=%d conf=%d success=%v err=%q txTotal=%d txFailed=%d extracted=%d elapsed=%s",
+		res.Height, res.NetworkBlockHeight, res.Header.Confirmations, res.Success, res.ErrorReason,
+		res.TxTotal, res.TxFailed, res.ExtractedTxs, time.Since(start))
+}
+
+// TestScanBlockOnce 测试“指定高度补扫一次”的能力（不进入持续循环）。
+func TestScanBlockOnceToken(t *testing.T) {
+	const iniContent = testIniContent
+
+	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	if err != nil {
+		t.Fatalf("NewAdapter error: %v", err)
+	}
+	rawScanner := adapter.GetBlockScanner()
+	bs, ok := rawScanner.(*ethscanner.EthBlockScanner)
+	if !ok {
+		t.Fatalf("unexpected BlockScanner type: %T", rawScanner)
+	}
+
+	// 全命中，确保能产出结果集（若本地节点对应高度无交易也可正常返回）。
+	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) types.ScanTargetResult {
+		if target.ScanTarget == "0x301db155664284b1462e1a10c082a9ff6e2b617f" {
+			return types.ScanTargetResult{Exist: true, SourceKey: "test1"}
+		}
+		return types.ScanTargetResult{Exist: true, SourceKey: "test2"}
+	})
+	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
+
+	start := time.Now()
+	res, err := rawScanner.ScanBlockOnce(uint64(testHeightToken))
+	if err != nil {
+		t.Fatalf("ScanBlockOnce(%d) error: %v", testHeightToken, err)
+	}
+	a, _ := json.Marshal(res)
+	fmt.Println(string(a))
+	if res == nil {
+		t.Fatalf("nil ScanBlockOnce result")
+	}
+	if res.Height != uint64(testHeightToken) {
+		t.Fatalf("unexpected height: got=%d want=%d", res.Height, testHeightToken)
+	}
+	if res.Header == nil {
+		t.Fatalf("nil header in result: %+v", res)
+	}
+	if res.Header.Height != uint64(testHeightToken) {
+		t.Fatalf("unexpected header.height: got=%d want=%d", res.Header.Height, testHeightToken)
 	}
 	if res.BlockHash == "" || res.Header.Hash == "" || res.Header.Hash != res.BlockHash {
 		t.Fatalf("unexpected block hash/header hash: blockHash=%q headerHash=%q", res.BlockHash, func() string {
