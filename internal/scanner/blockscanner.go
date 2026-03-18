@@ -10,9 +10,11 @@ package scanner
 //
 // 2. 交易提取层（Tx-level）：
 //    - 按 txid 精准提取主币与 ERC20 代币转账（ExtractTransactionAndReceiptData）
-//    - 主币：根据 tx.from / tx.to / value 构造 Transaction
+//    - 主币：根据 tx.from / tx.to / value 构造 Transaction，From/To 字段完整填充
 //    - Token：解析标准 ERC20 Transfer 事件（topics + data）构造 Transaction
+//      Coin.Symbol 为主币符号，Coin.Contract 填充代币合约信息（地址、符号、名称、精度）
 //    - 手续费：为 tx.from 所属账户生成独立 GAS 记录（FeeType="gas"），避免在多条 Token 记录上重复记费
+//      effectiveGasPrice 优先从 receipt 获取（EIP-1559），否则 fallback 到 tx.gasPrice
 //    - 通过 ScanTargetFunc 仅对关心的地址/账户（AccountID=SourceKey）生成记录，并按 SourceKey 聚合
 //
 // 3. 验证与对账层（Verify-level）：
@@ -29,6 +31,7 @@ package scanner
 //    - TxExtractConcurrency：控制单区块内按 txhash 并行提取的 goroutine 数量
 //    - tokenDecimalsCache：按合约地址缓存 ERC20 decimals，>0 表示有效精度，0 表示“查询失败/非标准 ERC20”，调用方必须跳过
 //    - blockTimestampCache：按 blockHash 缓存区块时间戳（秒），带上限与 FIFO 淘汰，避免重复 eth_getBlockByHash 与内存膨胀
+//      若获取失败，fallback 值为 0（非当前时间），上层需处理 confirmTime<=0 的情况
 //
 // 整体原则：
 // - 正确性优先：宁可跳过未知精度的 Token / 失败交易 / 未上链交易，也不猜测或“硬入账”
@@ -1158,18 +1161,19 @@ func extractAddressFromTopic(topic string) string {
 //   - 仅当 value>0 且 from 非空时才视为一笔主币转账
 //   - 通过 ScanTargetFunc(symbol, from/to) 判断地址归属哪个 AccountID(SourceKey)：
 //   - 若 from 与 to 归属同一 SourceKey：只生成一条记录（From=[from:amount], To=[to:amount]）
-//   - 若归属不同 SourceKey：from 账户生成出账记录（From 有值, To 仅在同源时填写），to 账户生成纯入账记录（To 有值, From 为空）
+//   - 若归属不同 SourceKey：from 账户生成出账记录（From=[from:amount], To=[to:amount]），
+//     to 账户生成入账记录（From=[from:amount], To=[to:amount]），两者 From/To 均完整填充
 //   - 主币记录本身不再重复记录手续费（Fees="0"），手续费统一通过 GAS 记录归集
 //   - 若 to 为空（合约创建），在 ExtParam["contract_creation"]="true" 标记，便于上层识别
 //
 // 3. 手续费（GAS）：
-//   - 手续费按 gasUsed * effectiveGasPrice（fallback 到 gasPrice）计算为 feeWei，并按 SymbolDecimal() 格式化为 feeStr
+//   - 手续费按 gasUsed * effectiveGasPrice（receipt 中优先，fallback 到 tx.gasPrice）计算为 feeWei，并按 SymbolDecimal() 格式化为 feeStr
 //   - 无论是否包含主币转账，只要 tx 成功且 tx.from 命中 ScanTargetFunc，都会为该 AccountID 生成一条独立 GAS 记录：
 //   - Coin = 原生币（ethCoin）
 //   - Amount = "0"
 //   - Fees   = feeStr
 //   - FeeType = "gas"
-//   - From   = [from:feeStr]，To 为空
+//   - From   = [from:feeStr]，To = [to:0]（To 保持与主币转账一致的格式）
 //   - 保证同一 AccountID+txid 最多仅一条记录包含非零 Fees，避免在多条业务记录上重复记费
 //
 // 4. ERC20 代币（Token）：
@@ -1183,7 +1187,10 @@ func extractAddressFromTopic(topic string) string {
 //   - decimals<=0 或查询失败时跳过该事件（绝不猜测默认 18）
 //   - 通过 ScanTargetFunc(contractAddr, fromToken/toToken) 判断代币归属的 AccountID：
 //   - from 命中：在该 SourceKey 下生成一条 From=[fromToken:amountStr], To=[toToken:amountStr] 的记录
-//   - to 命中：在该 SourceKey 下同样生成一条记录（不会与 from 合并，便于按 AccountID 维度独立入账）
+//   - to 命中：在该 SourceKey 下同样生成一条 From=[fromToken:amountStr], To=[toToken:amountStr] 的记录
+//     （两者 From/To 均完整填充，便于按 AccountID 维度独立入账）
+//   - Coin.Symbol = 主币符号（如 ETH）；Coin.IsContract = true
+//   - Coin.Contract 填充：Symbol=代币符号, Address=合约地址, Name=代币名称, Decimals=代币精度
 //   - Token 记录 Fees 始终为 "0"，手续费由 GAS 记录负责
 //   - 每条 Transfer 事件同时生成一条 SmartContractReceipt，key=txid:contractAddr:logIndex，用于 VerifyTransactionMatch 精确定位
 //
