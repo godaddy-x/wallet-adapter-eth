@@ -120,8 +120,8 @@ func (bs *EthBlockScanner) VerifyTransactionByTxID(txid string, scanTargetFunc a
 		BlockHash:        "",
 		Confirmations:    0,
 		Status:           "",
-		ExtractData:      make(map[string][]*types.TxExtractData),
-		ContractReceipts: make(map[string]*types.SmartContractReceipt),
+		ExtractData:      make([]*types.ExtractDataItem, 0),
+		ContractReceipts: make([]*types.ContractReceiptItem, 0),
 	}
 	if bs.wm != nil && bs.wm.Config != nil {
 		res.Symbol = bs.wm.Config.Symbol
@@ -330,8 +330,8 @@ func (bs *EthBlockScanner) VerifyTransactionMatch(txid string, expected *types.T
 			continue
 		}
 		k := txid + ":" + contract + ":" + strconv.FormatInt(tr.LogIndex, 10)
-		r, ok := chain.ContractReceipts[k]
-		if !ok || r == nil {
+		r := findContractReceipt(chain.ContractReceipts, k)
+		if r == nil {
 			out.Mismatches = append(out.Mismatches, "token receipt not found by logIndex")
 			continue
 		}
@@ -376,8 +376,8 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 		TxTotal:          0,
 		TxFailed:         0,
 		ExtractedTxs:     0,
-		ExtractData:      make(map[string][]*types.TxExtractData),
-		ContractReceipts: make(map[string]*types.SmartContractReceipt),
+		ExtractData:      make([]*types.ExtractDataItem, 0),
+		ContractReceipts: make([]*types.ContractReceiptItem, 0),
 	}
 	if bs.wm != nil && bs.wm.Config != nil {
 		res.Symbol = bs.wm.Config.Symbol
@@ -439,8 +439,8 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 		// worker pool 并行提取交易（块内并行、块间仍串行），提升吞吐并保持外部游标推进语义简单
 		type txExtractOut struct {
 			txHash           string
-			extractData      map[string][]*types.TxExtractData
-			contractReceipts map[string]*types.SmartContractReceipt
+			extractData      []*types.ExtractDataItem
+			contractReceipts []*types.ContractReceiptItem
 			err              error
 		}
 
@@ -493,7 +493,7 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 			close(outs)
 		}()
 
-		// 单线程合并结果，避免并发写 map
+		// 单线程合并结果，直接合并 slice，无 map 转换
 		for out := range outs {
 			if out.err != nil {
 				res.TxFailed++
@@ -504,14 +504,34 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 			}
 
 			if len(out.extractData) > 0 {
-				for k, list := range out.extractData {
-					res.ExtractData[k] = append(res.ExtractData[k], list...)
-					res.ExtractedTxs += uint64(len(list))
+				for _, item := range out.extractData {
+					if item == nil {
+						continue
+					}
+					// 查找是否已存在相同 SourceKey 的 item
+					found := false
+					for _, existing := range res.ExtractData {
+						if existing.SourceKey == item.SourceKey {
+							existing.Data = append(existing.Data, item.Data...)
+							found = true
+							break
+						}
+					}
+					if !found {
+						res.ExtractData = append(res.ExtractData, &types.ExtractDataItem{
+							SourceKey: item.SourceKey,
+							Data:      append([]*types.TxExtractData{}, item.Data...),
+						})
+					}
+					res.ExtractedTxs += uint64(len(item.Data))
 				}
 			}
 			if len(out.contractReceipts) > 0 {
-				for k, v := range out.contractReceipts {
-					res.ContractReceipts[k] = v
+				for _, item := range out.contractReceipts {
+					if item == nil {
+						continue
+					}
+					res.ContractReceipts = append(res.ContractReceipts, item)
 				}
 				res.ExtractedTxs += uint64(len(out.contractReceipts))
 			}
@@ -540,7 +560,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 	blockHeight uint64,
 	confirmTime int64,
 	scanTargetFunc adaptscanner.BlockScanTargetFunc,
-) (map[string][]*types.TxExtractData, map[string]*types.SmartContractReceipt, error) {
+) ([]*types.ExtractDataItem, []*types.ContractReceiptItem, error) {
 	if bs.wm == nil || bs.wm.Client == nil {
 		return nil, nil, fmt.Errorf("wallet manager or rpc client is nil")
 	}
@@ -881,8 +901,8 @@ func (bs *EthBlockScanner) RunScanLoop(
 						Height:           h,
 						Success:          false,
 						ErrorReason:      err.Error(),
-						ExtractData:      make(map[string][]*types.TxExtractData),
-						ContractReceipts: make(map[string]*types.SmartContractReceipt),
+						ExtractData:      make([]*types.ExtractDataItem, 0),
+						ContractReceipts: make([]*types.ContractReceiptItem, 0),
 						FailedTxIDs:      make([]string, 0),
 					}
 					if bs.wm != nil && bs.wm.Config != nil {
@@ -1195,10 +1215,10 @@ func extractAddressFromTopic(topic string) string {
 //   - 每条 Transfer 事件同时生成一条 SmartContractReceipt，key=txid:contractAddr:logIndex，用于 VerifyTransactionMatch 精确定位
 //
 // 5. 聚合维度：
-//   - 返回值 result:  map[SourceKey][]*TxExtractData ；SourceKey 通常是 AccountID
-//   - ContractReceipts: map[txid:contractAddr:logIndex]*SmartContractReceipt
+//   - 返回值 ExtractData:  []*types.ExtractDataItem 按 SourceKey 聚合
+//   - ContractReceipts: []*types.ContractReceiptItem 带 key 字段（如 txid:contractAddr:logIndex）
 //   - 上层可按 SourceKey 维度扫描账务，也可按 txid+logIndex 做逐条严格比对
-func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTargetFunc adaptscanner.BlockScanTargetFunc) (map[string][]*types.TxExtractData, map[string]*types.SmartContractReceipt, error) {
+func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTargetFunc adaptscanner.BlockScanTargetFunc) ([]*types.ExtractDataItem, []*types.ContractReceiptItem, error) {
 	if bs.wm == nil || bs.wm.Client == nil {
 		return nil, nil, fmt.Errorf("wallet manager or rpc client is nil")
 	}
@@ -1294,7 +1314,7 @@ func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTar
 }
 
 // extractTransactionAndReceiptDataFromParsed 统一的“生成结果集”逻辑（扫块/verify 复用）。
-// 输入已解析好的 tx 基础字段 + receipt（用于 logs/status/gasUsed 等），输出交易单与合约回执集合。
+// 输入已解析好的 tx 基础字段 + receipt（用于 logs/status/gasUsed 等），输出交易单与合约回执集合（直接生成 slice，无 map 转换）。
 func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	txid string,
 	from string,
@@ -1309,9 +1329,23 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	status string,
 	rcRes *gjson.Result,
 	scanTargetFunc adaptscanner.BlockScanTargetFunc,
-) (map[string][]*types.TxExtractData, map[string]*types.SmartContractReceipt, error) {
-	result := make(map[string][]*types.TxExtractData)
-	contractReceipts := make(map[string]*types.SmartContractReceipt)
+) ([]*types.ExtractDataItem, []*types.ContractReceiptItem, error) {
+	var extractData []*types.ExtractDataItem
+	var contractReceipts []*types.ContractReceiptItem
+
+	// 辅助函数：向 extractData 中添加数据，按 SourceKey 聚合
+	appendExtractData := func(sourceKey string, data *types.TxExtractData) {
+		for _, item := range extractData {
+			if item.SourceKey == sourceKey {
+				item.Data = append(item.Data, data)
+				return
+			}
+		}
+		extractData = append(extractData, &types.ExtractDataItem{
+			SourceKey: sourceKey,
+			Data:      []*types.TxExtractData{data},
+		})
+	}
 
 	// 构造主币 Coin
 	ethCoin := types.Coin{
@@ -1342,7 +1376,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = feeTxObj
-			result[fromFeeRes.SourceKey] = append(result[fromFeeRes.SourceKey], data)
+			appendExtractData(fromFeeRes.SourceKey, data)
 		}
 	}
 
@@ -1384,7 +1418,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
-			result[fromRes.SourceKey] = append(result[fromRes.SourceKey], data)
+			appendExtractData(fromRes.SourceKey, data)
 		}
 
 		if toResExist && actualTo != "" {
@@ -1406,7 +1440,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				}
 				data := types.NewTxExtractData()
 				data.Transaction = txObj
-				result[toRes.SourceKey] = append(result[toRes.SourceKey], data)
+				appendExtractData(toRes.SourceKey, data)
 			}
 		}
 	}
@@ -1470,16 +1504,16 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 		tokenAmountStr := util.BigIntToDecimal(tokenAmount, tokenDecimals)
 
 		tokenCoin := types.Coin{
-			Symbol:     bs.wm.Config.Symbol, // 使用主币符号
+			Symbol:     bs.wm.Config.Symbol,
 			IsContract: true,
 			Contract: types.SmartContract{
 				ContractID: "",
-				Symbol:     "",           // 代币符号
-				Address:    contractAddr, // 合约地址
+				Symbol:     "",
+				Address:    contractAddr,
 				Token:      "",
 				Protocol:   "",
-				Name:       "",                    // 代币名称
-				Decimals:   uint64(tokenDecimals), // 代币精度
+				Name:       "",
+				Decimals:   uint64(tokenDecimals),
 			},
 		}
 
@@ -1506,7 +1540,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
-			result[fromRes.SourceKey] = append(result[fromRes.SourceKey], data)
+			appendExtractData(fromRes.SourceKey, data)
 		}
 		if toRes.Exist {
 			txObj := &types.Transaction{
@@ -1526,23 +1560,26 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
-			result[toRes.SourceKey] = append(result[toRes.SourceKey], data)
+			appendExtractData(toRes.SourceKey, data)
 		}
 
 		receiptKey := txid + ":" + contractAddr + ":" + strconv.Itoa(logIdx)
-		contractReceipts[receiptKey] = &types.SmartContractReceipt{
-			Coin:        tokenCoin,
-			TxID:        txid,
-			From:        fromToken,
-			To:          toToken,
-			Value:       tokenAmountStr,
-			Fees:        "0",
-			BlockHash:   blockHash,
-			BlockHeight: blockHeight,
-			Status:      status,
-			LogIndex:    int64(logIdx),
-		}
+		contractReceipts = append(contractReceipts, &types.ContractReceiptItem{
+			Key: receiptKey,
+			Receipt: &types.SmartContractReceipt{
+				Coin:        tokenCoin,
+				TxID:        txid,
+				From:        fromToken,
+				To:          toToken,
+				Value:       tokenAmountStr,
+				Fees:        "0",
+				BlockHash:   blockHash,
+				BlockHeight: blockHeight,
+				Status:      status,
+				LogIndex:    int64(logIdx),
+			},
+		})
 	}
 
-	return result, contractReceipts, nil
+	return extractData, contractReceipts, nil
 }

@@ -138,8 +138,11 @@ func TestScanBlockWithResultFlow(t *testing.T) {
 
 	// 基本一致性检查：ExtractedTxs 应至少覆盖返回的条目数量（TxExtractData + 合约回执）
 	var extractCount uint64
-	for _, list := range res.ExtractData {
-		extractCount += uint64(len(list))
+	for _, item := range res.ExtractData {
+		if item == nil {
+			continue
+		}
+		extractCount += uint64(len(item.Data))
 	}
 	receiptCount := uint64(len(res.ContractReceipts))
 	if res.ExtractedTxs < extractCount+receiptCount {
@@ -274,8 +277,11 @@ func TestVerifyTransactionMatch(t *testing.T) {
 	}
 	var from, to, amountStr string
 found:
-	for _, list := range chain.ExtractData {
-		for _, d := range list {
+	for _, item := range chain.ExtractData {
+		if item == nil {
+			continue
+		}
+		for _, d := range item.Data {
 			if d == nil || d.Transaction == nil {
 				continue
 			}
