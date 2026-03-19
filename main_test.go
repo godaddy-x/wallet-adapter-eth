@@ -469,6 +469,8 @@ func TestRunScanLoopContinuously(t *testing.T) {
 	var windowSize uint64 = 0
 	startHeight := testHeight
 
+	rawScanner.Pause()
+
 	go func() {
 		if err := rawScanner.RunScanLoop(uint64(startHeight), confirmations, windowSize, 5*time.Second, func(res *types.BlockScanResult) {
 			if res == nil {
@@ -492,8 +494,8 @@ func TestRunScanLoopContinuously(t *testing.T) {
 	}()
 
 	time.Sleep(5 * time.Second)
-	t.Log("重置高度----")
-	rawScanner.ResetScanHeight(testHeight)
+
+	rawScanner.Run()
 
 	t.Logf("RunScanLoop started: latest=%d startHeight=%d confirmations=%d windowSize=%d, running ~10 minutes...",
 		latest, startHeight, confirmations, windowSize)
