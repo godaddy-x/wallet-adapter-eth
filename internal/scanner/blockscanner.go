@@ -900,6 +900,16 @@ func (bs *EthBlockScanner) RunScanLoop(
 			scanFrom = windowFrom
 		}
 
+		// 优化：如果 scanFrom > safeTo，说明没有新高度需要扫描（已追平最新安全高度）
+		// 此时直接跳过内层扫描，仅等待 interval 后再次检查
+		if scanFrom > safeTo {
+			select {
+			case <-time.After(interval):
+			case <-bs.getPauseCh():
+			}
+			continue
+		}
+
 		// 扫描区间 [scanFrom..safeTo]：
 		// - 扫描失败不退出 loop；
 		// - 当某高度失败时，停留在该高度持续重试（不推进 cursor），并将失败结果回调给业务侧；
