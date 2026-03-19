@@ -469,8 +469,6 @@ func TestRunScanLoopContinuously(t *testing.T) {
 	var windowSize uint64 = 0
 	startHeight := testHeight
 
-	rawScanner.Pause()
-
 	go func() {
 		if err := rawScanner.RunScanLoop(uint64(startHeight), confirmations, windowSize, 5*time.Second, func(res *types.BlockScanResult) {
 			if res == nil {
@@ -478,6 +476,9 @@ func TestRunScanLoopContinuously(t *testing.T) {
 				return
 			}
 			time.Sleep(100 * time.Millisecond)
+			if res.Once {
+				fmt.Printf("[RunScanLoop] once -------------- %d - %d\n", res.Height, res.NetworkBlockHeight)
+			}
 			latestMax := rawScanner.GetGlobalMaxBlockHeight()
 			headerHash := ""
 			prevHash := ""
@@ -485,17 +486,29 @@ func TestRunScanLoopContinuously(t *testing.T) {
 				headerHash = res.Header.Hash
 				prevHash = res.Header.Previousblockhash
 			}
-			fmt.Printf("[RunScanLoop] scanHeight=%d latestMax=%d hash=%s header=%s prev=%s success=%v err=%q txTotal=%d txFailed=%d extracted=%d\n",
+			fmt.Printf("[RunScanLoop] scanHeight=%d latestMax=%d hash=%s header=%s prev=%s success=%v err=%q txTotal=%d txFailed=%d extracted=%d once=%v\n",
 				res.Height, latestMax, res.BlockHash, headerHash, prevHash, res.Success, res.ErrorReason,
-				res.TxTotal, res.TxFailed, res.ExtractedTxs)
+				res.TxTotal, res.TxFailed, res.ExtractedTxs, res.Once)
 		}); err != nil {
 			fmt.Printf("[RunScanLoop] error: %v\n", err)
 		}
 	}()
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 
-	rawScanner.Run()
+	// 获取当前 latest 用于调试
+	latestBefore := rawScanner.GetGlobalMaxBlockHeight()
+	t.Logf("Before ScanBlockPrioritize: latest=%d", latestBefore)
+
+	// 使用合理的高度范围：在 safeTo = latest - 6 范围内选择
+	// 假设 latest ~ 83156+10=83166, safeTo = 83160
+	// 选择高度 83150（在 startHeight 83156 附近，且在 safeTo 范围内）
+	prioritizeHeights := []uint64{1, 100, 1333}
+	if err := rawScanner.ScanBlockPrioritize(prioritizeHeights); err != nil {
+		t.Fatalf("ScanBlockPrioritize error: %v", err)
+		return
+	}
+	t.Logf("ScanBlockPrioritize called with heights: %v", prioritizeHeights)
 
 	t.Logf("RunScanLoop started: latest=%d startHeight=%d confirmations=%d windowSize=%d, running ~10 minutes...",
 		latest, startHeight, confirmations, windowSize)

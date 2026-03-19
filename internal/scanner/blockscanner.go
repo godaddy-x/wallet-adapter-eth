@@ -102,6 +102,16 @@ type EthBlockScanner struct {
 	// 采用 FIFO 淘汰策略（简单且足够用）。
 	blockTimestampCacheMax   int
 	blockTimestampCacheOrder []string
+
+	// priorityScan 插队扫描相关状态
+	// 用于 RunScanLoop 中优先处理指定高度，暂停主线扫描
+	priorityScanMu    sync.Mutex
+	priorityHeights   []uint64 // 插队高度列表
+
+	// scanLoopConfig 保存 RunScanLoop 的配置
+	// 用于插队扫描时复用相同的参数
+	scanLoopConfirmations uint64                   // 确认数要求
+	scanLoopHandleFunc    func(*types.BlockScanResult) // 回调函数
 }
 
 // VerifyTransactionByTxID 入账前按 txid 二次复核链上结果并返回可入账结果集。
@@ -825,6 +835,10 @@ func (bs *EthBlockScanner) RunScanLoop(
 		interval = 5 * time.Second
 	}
 
+	// 保存 RunScanLoop 配置，供插队扫描复用
+	bs.scanLoopConfirmations = confirmations
+	bs.scanLoopHandleFunc = handleBlock
+
 	// cursor 表示“已处理到的安全高度”（safeTo）。
 	// 为了让第一次扫描命中 startHeight，我们把 cursor 初始化到 startHeight-1。
 	// 当 startHeight==0 时，cursor 保持为 0，第一次扫描从 0 开始（inclusive）。
@@ -837,6 +851,9 @@ func (bs *EthBlockScanner) RunScanLoop(
 
 	for {
 		bs.blockIfPaused()
+
+		// 优先处理插队扫描任务
+		bs.processPriorityScan()
 
 		latest := bs.GetGlobalMaxBlockHeight()
 		if latest == 0 {
@@ -890,6 +907,9 @@ func (bs *EthBlockScanner) RunScanLoop(
 		completed := true
 		for h := scanFrom; h <= safeTo; h++ {
 			bs.blockIfPaused()
+
+			// 每处理一个高度前，先检查并处理插队任务（真正的插队逻辑）
+			bs.processPriorityScan()
 
 			res, err := bs.ScanBlockWithResult(h)
 			if err != nil {
@@ -1029,6 +1049,162 @@ func (bs *EthBlockScanner) ScanBlockOnce(height uint64) (*types.BlockScanResult,
 		}
 	}
 	return res, err
+}
+
+// ScanBlockPrioritize 插队扫描指定高度列表。
+// 说明：
+// - 将插队高度加入优先队列，RunScanLoop 会在主线扫描间隙优先处理这些高度；
+// - 插队高度的扫描结果复用 RunScanLoop 的 handleBlock（如果 RunScanLoop 未运行则无回调）；
+// - 插队扫描不影响 RunScanLoop 的主线 cursor 推进逻辑；
+// - 插队高度按升序处理，且去重；
+// - 严格要求所有传入的高度都满足 confirmations 要求（使用 RunScanLoop 的 confirmations）；
+// - 如果 RunScanLoop 未运行，confirmations 默认为 0（此时只检查 height <= latest）；
+// - 不满足条件的高度直接返回错误，调用方可根据错误信息调整高度后重试。
+func (bs *EthBlockScanner) ScanBlockPrioritize(heights []uint64) error {
+	if bs.wm == nil || bs.wm.Client == nil {
+		return fmt.Errorf("wallet manager or rpc client is nil")
+	}
+	if len(heights) == 0 {
+		return nil
+	}
+
+	// 获取链上最新高度，计算安全高度上限
+	latest := bs.GetGlobalMaxBlockHeight()
+	if latest == 0 {
+		return fmt.Errorf("cannot get latest block height")
+	}
+
+	// 使用 RunScanLoop 的 confirmations（如果 RunScanLoop 未运行，默认为 0）
+	confirmations := bs.scanLoopConfirmations
+
+	// 计算安全高度上限（满足 confirmations 要求的最大高度）
+	var safeTo uint64
+	if latest > confirmations {
+		safeTo = latest - confirmations
+	} else {
+		safeTo = 0
+	}
+
+	// 检查所有高度是否都满足 confirmations 要求
+	var invalidHeights []uint64
+	for _, h := range heights {
+		if h > safeTo {
+			invalidHeights = append(invalidHeights, h)
+		}
+	}
+
+	// 如果有不满足条件的高度，直接返回错误
+	if len(invalidHeights) > 0 {
+		return fmt.Errorf("heights %v exceed safe range (max allowed: %d, latest: %d, confirmations: %d)",
+			invalidHeights, safeTo, latest, confirmations)
+	}
+
+	bs.priorityScanMu.Lock()
+	defer bs.priorityScanMu.Unlock()
+
+	// 将新高度加入队列（去重）
+	heightMap := make(map[uint64]bool)
+	for _, h := range bs.priorityHeights {
+		heightMap[h] = true
+	}
+	added := 0
+	for _, h := range heights {
+		if !heightMap[h] {
+			heightMap[h] = true
+			bs.priorityHeights = append(bs.priorityHeights, h)
+			added++
+		}
+	}
+
+	// DEBUG: 打印队列状态
+	fmt.Printf("[ScanBlockPrioritize] added %d heights, current queue: %v\n", added, bs.priorityHeights)
+
+	// 排序，确保按高度升序处理
+	// 使用简单冒泡排序（数据量小）
+	for i := 0; i < len(bs.priorityHeights); i++ {
+		for j := i + 1; j < len(bs.priorityHeights); j++ {
+			if bs.priorityHeights[i] > bs.priorityHeights[j] {
+				bs.priorityHeights[i], bs.priorityHeights[j] = bs.priorityHeights[j], bs.priorityHeights[i]
+			}
+		}
+	}
+
+	return nil
+}
+
+// processPriorityScan 处理插队扫描（由 RunScanLoop 调用）
+// 返回处理的高度数量和是否继续处理
+func (bs *EthBlockScanner) processPriorityScan() int {
+	bs.priorityScanMu.Lock()
+	if len(bs.priorityHeights) == 0 {
+		bs.priorityScanMu.Unlock()
+		return 0
+	}
+
+	// DEBUG: 打印插队队列内容
+	fmt.Printf("[processPriorityScan] processing heights: %v\n", bs.priorityHeights)
+
+	// 复制当前队列
+	heights := make([]uint64, len(bs.priorityHeights))
+	copy(heights, bs.priorityHeights)
+
+	// 清空队列
+	bs.priorityHeights = bs.priorityHeights[:0]
+	bs.priorityScanMu.Unlock()
+
+	// 获取 handleBlock 函数（可能为 nil，如果 RunScanLoop 未运行）
+	handleFunc := bs.scanLoopHandleFunc
+
+	// 获取链上最新高度，计算安全高度上限
+	latest := bs.GetGlobalMaxBlockHeight()
+	confirmations := bs.scanLoopConfirmations
+	var safeTo uint64
+	if latest > confirmations {
+		safeTo = latest - confirmations
+	} else {
+		safeTo = 0
+	}
+
+	processed := 0
+	// 扫描所有插队高度（二次安全检查）
+	for _, h := range heights {
+		// 安全检查：仅处理满足 confirmations 要求的高度
+		if h > safeTo {
+			// 跳过不满足条件的高度，继续处理下一个
+			continue
+		}
+
+		bs.blockIfPaused()
+
+		res, err := bs.ScanBlockWithResult(h)
+		if err != nil {
+			// 构造失败结果
+			if res == nil {
+				res = &types.BlockScanResult{
+					Symbol:           bs.wm.Config.Symbol,
+					Height:           h,
+					Success:          false,
+					ErrorReason:      err.Error(),
+					ExtractData:      make([]*types.ExtractDataItem, 0),
+					ContractReceipts: make([]*types.ContractReceiptItem, 0),
+					FailedTxIDs:      make([]string, 0),
+					Once:             true, // 标记为插队扫描
+				}
+			}
+		}
+
+		if res != nil {
+			res.NetworkBlockHeight = latest
+			res.Once = true // 标记为插队扫描结果
+			// 复用 RunScanLoop 的 handleBlock，如果设置了的话
+			if handleFunc != nil {
+				handleFunc(res)
+			}
+		}
+		processed++
+	}
+
+	return processed
 }
 
 // GetCurrentBlockHeader 查询链上最新区块头（latest），用于同步状态与初始化扫描进度。
