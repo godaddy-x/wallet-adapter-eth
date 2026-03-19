@@ -1090,6 +1090,53 @@ func (bs *EthBlockScanner) GetGlobalMaxBlockHeight() uint64 {
 	return h
 }
 
+// GetBalanceByAddress 查询指定地址的余额。
+// 使用上层提供的 QueryBalancesConcurrent 辅助函数进行并发查询。
+func (bs *EthBlockScanner) GetBalanceByAddress(address ...string) ([]*types.Balance, error) {
+	if bs.wm == nil || bs.wm.Client == nil {
+		return nil, fmt.Errorf("wallet manager or rpc client is nil")
+	}
+
+	if len(address) == 0 {
+		return []*types.Balance{}, nil
+	}
+
+	// 定义单个地址查询函数，符合 BalanceQueryFunc 签名
+	queryFunc := func(addr string) (confirmed, unconfirmed, total string, err error) {
+		// 查询 confirmed 余额（latest）
+		balanceConfirmed, err := bs.wm.GetAddrBalance(addr, "latest")
+		if err != nil {
+			return "", "", "", fmt.Errorf("get confirmed balance for %s failed: %w", addr, err)
+		}
+
+		// 查询 pending 余额（包含未确认交易）
+		balanceAll, err := bs.wm.GetAddrBalance(addr, "pending")
+		if err != nil {
+			// 如果 pending 查询失败，使用 confirmed 余额作为 all
+			balanceAll = balanceConfirmed
+		}
+
+		// 计算未确认余额
+		balanceUnconfirmed := big.NewInt(0)
+		balanceUnconfirmed.Sub(balanceAll, balanceConfirmed)
+
+		confirmedStr := util.BigIntToDecimal(balanceConfirmed, bs.wm.SymbolDecimal())
+		allStr := util.BigIntToDecimal(balanceAll, bs.wm.SymbolDecimal())
+		unconfirmedStr := util.BigIntToDecimal(balanceUnconfirmed, bs.wm.SymbolDecimal())
+
+		return confirmedStr, unconfirmedStr, allStr, nil
+	}
+
+	// 使用上层 Base 的并发查询辅助函数
+	// 默认并发度 20，可通过 bs.TxExtractConcurrency 调整
+	concurrency := bs.TxExtractConcurrency
+	if concurrency <= 0 {
+		concurrency = 20
+	}
+
+	return bs.Base.QueryBalancesConcurrent(bs.wm.Config.Symbol, address, queryFunc, concurrency)
+}
+
 // padTo32Bytes 工具函数：将字节切片左补零至 32 字节（用于 ABI uint256 解析）
 func padTo32Bytes(b []byte) []byte {
 	if len(b) >= 32 {
