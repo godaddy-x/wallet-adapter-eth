@@ -10,18 +10,24 @@ package scanner
 //
 // 2. 交易提取层（Tx-level）：
 //    - 按 txid 精准提取主币与 ERC20 代币转账（ExtractTransactionAndReceiptData）
-//    - 主币：根据 tx.from / tx.to / value 构造 Transaction，From/To 字段完整填充
+//    - 主币：根据 tx.from / tx.to / value 构造 Transaction，FromAddr/FromAmt/ToAddr/ToAmt 字段分离设计
+//      发送方地址与金额：FromAddr/FromAmt；接收方地址与金额：ToAddr/ToAmt（强制一一对应校验）
 //    - Token：解析标准 ERC20 Transfer 事件（topics + data）构造 Transaction
 //      Coin.Symbol 为主币符号，Coin.Contract 填充代币合约信息（地址、符号、名称、精度）
-//    - 手续费：为 tx.from 所属账户生成独立 GAS 记录（FeeType="gas"），避免在多条 Token 记录上重复记费
+//      安全校验：严格检查 data 长度（32字节或64字节），防止恶意合约的金额解析攻击
+//    - 手续费：为 tx.from 所属账户生成独立 GAS 记录（FeeType="gas", TxAction="fee"），避免在多条 Token 记录上重复记费
 //      effectiveGasPrice 优先从 receipt 获取（EIP-1559），否则 fallback 到 tx.gasPrice
+//    - 方向标记：通过 TxAction 字段标识交易方向（"send"=转出, "receive"=转入, "internal"=内部转账, "fee"=手续费）
+//    - 输出索引：通过 OutputIndex 字段区分多笔记录（-2=手续费, -1=主币, 0+=合约事件索引）
+//    - 合约创建：检测 to 为空的情况，捕获 contractAddress，并为新合约生成入账记录（如果被监控）
+//    - 数据校验：通过 validateAddrAmtMatch 强制校验 FromAddr/FromAmt 和 ToAddr/ToAmt 长度一致
 //    - 通过 ScanTargetFunc 仅对关心的地址/账户（AccountID=SourceKey）生成记录，并按 SourceKey 聚合
 //
 // 3. 验证与对账层（Verify-level）：
 //    - VerifyTransactionByTxID：按 txid + minConfirmations 从链上二次复核（存在 / 成功 / 确认数），
 //      并重新跑提取逻辑，返回可入账结果集 TxVerifyResult
 //    - VerifyTransactionMatch：在 VerifyTransactionByTxID 基础上，与业务期望对象 TxVerifyExpected 严格比对
-//      （主币比对 from/to/value，代币基于 txid+contractAddr+logIndex 精确定位单条 Transfer）
+//      （主币比对 from/to/value，代币基于 txid+contractAddr+outputIndex 精确定位单条 Transfer）
 //
 // 4. 持续扫描循环（Cursor-level）：
 //    - RunScanLoop：从指定起始高度 startHeight 开始（inclusive），持续扫描至 safeTo=latest-confirmations，
@@ -55,6 +61,9 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// splitAddrAmount 辅助函数：从 "address:amount" 格式字符串中分离地址和金额
+// 用于 decoder 层将旧格式 TxFrom/TxTo 转换为新的分离字段结构
+// 注意：扫块器内部直接使用 FromAddr/FromAmt/ToAddr/ToAmt，无需调用此函数
 func splitAddrAmount(s string) (addr string, amount string) {
 	parts := strings.SplitN(s, ":", 2)
 	if len(parts) == 2 {
@@ -105,12 +114,12 @@ type EthBlockScanner struct {
 
 	// priorityScan 插队扫描相关状态
 	// 用于 RunScanLoop 中优先处理指定高度，暂停主线扫描
-	priorityScanMu    sync.Mutex
-	priorityHeights   []uint64 // 插队高度列表
+	priorityScanMu  sync.Mutex
+	priorityHeights []uint64 // 插队高度列表
 
 	// scanLoopConfig 保存 RunScanLoop 的配置
 	// 用于插队扫描时复用相同的参数
-	scanLoopConfirmations uint64                   // 确认数要求
+	scanLoopConfirmations uint64                       // 确认数要求
 	scanLoopHandleFunc    func(*types.BlockScanResult) // 回调函数
 }
 
@@ -324,9 +333,9 @@ func (bs *EthBlockScanner) VerifyTransactionMatch(txid string, expected *types.T
 			continue
 		}
 
-		// 代币：严格模式必须提供 logIndex，用于唯一定位同一 tx 内的 Transfer 事件
-		if tr.LogIndex < 0 {
-			out.Mismatches = append(out.Mismatches, "token logIndex required for strict match")
+		// 代币：严格模式必须提供 outputIndex，用于唯一定位同一 tx 内的 Transfer 事件
+		if tr.OutputIndex < 0 {
+			out.Mismatches = append(out.Mismatches, "token outputIndex required for strict match")
 			continue
 		}
 		expDecimals := int32(tr.Decimals)
@@ -339,15 +348,15 @@ func (bs *EthBlockScanner) VerifyTransactionMatch(txid string, expected *types.T
 			out.Mismatches = append(out.Mismatches, "token amount parse error")
 			continue
 		}
-		k := txid + ":" + contract + ":" + strconv.FormatInt(tr.LogIndex, 10)
+		k := txid + ":" + contract + ":" + strconv.FormatInt(tr.OutputIndex, 10)
 		r := findContractReceipt(chain.ContractReceipts, k)
 		if r == nil {
-			out.Mismatches = append(out.Mismatches, "token receipt not found by logIndex")
+			out.Mismatches = append(out.Mismatches, "token receipt not found by outputIndex")
 			continue
 		}
-		// 事件精确定位：LogIndex 必须与 expected 完全一致
-		if r.LogIndex != tr.LogIndex {
-			out.Mismatches = append(out.Mismatches, "token logIndex mismatch")
+		// 事件精确定位：OutputIndex 必须与 expected 完全一致
+		if r.OutputIndex != tr.OutputIndex {
+			out.Mismatches = append(out.Mismatches, "token outputIndex mismatch")
 			continue
 		}
 		if strings.ToLower(r.From) != expFrom {
@@ -855,8 +864,25 @@ func (bs *EthBlockScanner) RunScanLoop(
 		// 优先处理插队扫描任务
 		bs.processPriorityScan()
 
-		latest := bs.GetGlobalMaxBlockHeight()
-		if latest == 0 {
+		latest, rpcErr := bs.GetGlobalMaxBlockHeightWithError()
+		if rpcErr != nil || latest == 0 {
+			errMsg := ""
+			if rpcErr != nil {
+				errMsg = rpcErr.Error()
+			} else {
+				errMsg = "cannot get latest block height (returned 0)"
+			}
+			// 通过回调通知业务层 RPC 连接异常
+			if handleBlock != nil {
+				handleBlock(&types.BlockScanResult{
+					Symbol:           bs.wm.Config.Symbol,
+					Success:          false,
+					ErrorReason:      errMsg,
+					ExtractData:      make([]*types.ExtractDataItem, 0),
+					ContractReceipts: make([]*types.ContractReceiptItem, 0),
+					FailedTxIDs:      make([]string, 0),
+				})
+			}
 			// 等待 interval，但允许 Pause 立即打断并进入阻塞
 			select {
 			case <-time.After(interval):
@@ -1079,9 +1105,12 @@ func (bs *EthBlockScanner) ScanBlockPrioritize(heights []uint64) error {
 	}
 
 	// 获取链上最新高度，计算安全高度上限
-	latest := bs.GetGlobalMaxBlockHeight()
+	latest, rpcErr := bs.GetGlobalMaxBlockHeightWithError()
+	if rpcErr != nil {
+		return fmt.Errorf("cannot get latest block height: %w", rpcErr)
+	}
 	if latest == 0 {
-		return fmt.Errorf("cannot get latest block height")
+		return fmt.Errorf("cannot get latest block height: returned 0")
 	}
 
 	// 使用 RunScanLoop 的 confirmations（如果 RunScanLoop 未运行，默认为 0）
@@ -1166,7 +1195,27 @@ func (bs *EthBlockScanner) processPriorityScan() int {
 	handleFunc := bs.scanLoopHandleFunc
 
 	// 获取链上最新高度，计算安全高度上限
-	latest := bs.GetGlobalMaxBlockHeight()
+	latest, rpcErr := bs.GetGlobalMaxBlockHeightWithError()
+	if rpcErr != nil || latest == 0 {
+		errMsg := ""
+		if rpcErr != nil {
+			errMsg = rpcErr.Error()
+		} else {
+			errMsg = "cannot get latest block height (returned 0)"
+		}
+		// 通过回调通知业务层 RPC 连接异常
+		if handleFunc != nil {
+			handleFunc(&types.BlockScanResult{
+				Symbol:           bs.wm.Config.Symbol,
+				Success:          false,
+				ErrorReason:      "[PriorityScan] " + errMsg,
+				ExtractData:      make([]*types.ExtractDataItem, 0),
+				ContractReceipts: make([]*types.ContractReceiptItem, 0),
+				FailedTxIDs:      make([]string, 0),
+			})
+		}
+		return 0
+	}
 	confirmations := bs.scanLoopConfirmations
 	var safeTo uint64
 	if latest > confirmations {
@@ -1261,19 +1310,27 @@ func (bs *EthBlockScanner) GetCurrentBlockHeader() (*types.BlockHeader, error) {
 }
 
 // GetGlobalMaxBlockHeight 获取链上最新区块高度（network height）。
+// 注意：此方法在 RPC 失败时返回 0，错误信息被静默丢弃；如需获取错误详情请使用 GetGlobalMaxBlockHeightWithError。
 func (bs *EthBlockScanner) GetGlobalMaxBlockHeight() uint64 {
+	h, _ := bs.GetGlobalMaxBlockHeightWithError()
+	return h
+}
+
+// GetGlobalMaxBlockHeightWithError 获取链上最新区块高度，并返回可能的 RPC 错误。
+// 该方法在节点连接断开或 RPC 调用失败时返回具体错误信息，供上层进行错误处理与告警。
+func (bs *EthBlockScanner) GetGlobalMaxBlockHeightWithError() (uint64, error) {
 	if bs.wm == nil || bs.wm.Client == nil {
-		return 0
+		return 0, fmt.Errorf("wallet manager or rpc client is nil")
 	}
 	result, err := bs.wm.Client.Call("eth_blockNumber", nil)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("rpc call eth_blockNumber failed: %w", err)
 	}
 	h, err := hexutil.DecodeUint64(result.String())
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("decode block number failed: %w", err)
 	}
-	return h
+	return h, nil
 }
 
 // GetBalanceByAddress 查询指定地址的余额。
@@ -1323,15 +1380,6 @@ func (bs *EthBlockScanner) GetBalanceByAddress(address ...string) ([]*types.Bala
 	return bs.Base.QueryBalancesConcurrent(bs.wm.Config.Symbol, address, queryFunc, concurrency)
 }
 
-// padTo32Bytes 工具函数：将字节切片左补零至 32 字节（用于 ABI uint256 解析）
-func padTo32Bytes(b []byte) []byte {
-	if len(b) >= 32 {
-		return b[len(b)-32:] // 截断高位（理论上不应发生）
-	}
-	padded := make([]byte, 32)
-	copy(padded[32-len(b):], b)
-	return padded
-}
 
 // getBlockTimestamp 根据 blockHash 获取区块时间戳（秒），并做本地缓存。
 // fallback 用于 RPC 失败或节点返回异常数据时兜底（不做硬失败，保证扫描可继续）。
@@ -1413,11 +1461,13 @@ func extractAddressFromTopic(topic string) string {
 //   - 根据 tx.from / tx.to / value 解析出主币金额（按 SymbolDecimal() 格式化为十进制字符串）
 //   - 仅当 value>0 且 from 非空时才视为一笔主币转账
 //   - 通过 ScanTargetFunc(symbol, from/to) 判断地址归属哪个 AccountID(SourceKey)：
-//   - 若 from 与 to 归属同一 SourceKey：只生成一条记录（From=[from:amount], To=[to:amount]）
-//   - 若归属不同 SourceKey：from 账户生成出账记录（From=[from:amount], To=[to:amount]），
-//     to 账户生成入账记录（From=[from:amount], To=[to:amount]），两者 From/To 均完整填充
-//   - 主币记录本身不再重复记录手续费（Fees="0"），手续费统一通过 GAS 记录归集
-//   - 若 to 为空（合约创建），在 ExtParam["contract_creation"]="true" 标记，便于上层识别
+//   - 若 from 与 to 归属同一 SourceKey：只生成一条记录（FromAddr=[from], FromAmt=[amount], ToAddr=[to], ToAmt=[amount]），TxAction="internal"
+//   - 若归属不同 SourceKey：from 账户生成出账记录（TxAction="send"），to 账户生成入账记录（TxAction="receive"）
+//   - 主币记录 Fees="0"，OutputIndex=-1，手续费统一通过 GAS 记录归集
+//   - 若 to 为空（合约创建）：
+//     * ExtParam["contract_creation"]="true"，ExtParam["contract_address"]=创建的合约地址
+//     * 为发送方生成 TxAction="send" 的支出记录
+//     * 如果创建的合约地址被监控，额外为其生成 TxAction="receive" 的入账记录（确保合约创建时转入的 ETH 被正确归属）
 //
 // 3. 手续费（GAS）：
 //   - 手续费按 gasUsed * effectiveGasPrice（receipt 中优先，fallback 到 tx.gasPrice）计算为 feeWei，并按 SymbolDecimal() 格式化为 feeStr
@@ -1426,31 +1476,35 @@ func extractAddressFromTopic(topic string) string {
 //   - Amount = "0"
 //   - Fees   = feeStr
 //   - FeeType = "gas"
-//   - From   = [from:feeStr]，To = [to:0]（To 保持与主币转账一致的格式）
+//   - TxAction = "fee"
+//   - OutputIndex = -2（与主币-1、合约事件0+区分）
+//   - FromAddr=[from], FromAmt=[feeStr], ToAddr=[], ToAmt=[]
 //   - 保证同一 AccountID+txid 最多仅一条记录包含非零 Fees，避免在多条业务记录上重复记费
 //
 // 4. ERC20 代币（Token）：
 //   - 从回执 logs 中筛选标准 ERC20 Transfer 事件（topic0 固定为 Transfer(address,address,uint256)）
-//   - Case1：topics[1]=from, topics[2]=to, data=amount
+//   - Case1（标准）：topics[1]=from, topics[2]=to, data=32字节amount
+//     * 安全校验：严格检查 data 长度必须为 32 字节，拒绝恶意合约的非标准事件
+//   - Case2（非标准）：topics[1]=from, data=64字节（32字节to地址+32字节amount）
+//     * 安全校验：严格检查 data 长度必须为 64 字节
 //   - 通过 extractAddressFromTopic 从 32 字节 topic 中提取地址
-//   - Case2：topics[1]=from, data 前 32 字节为右对齐的 to 地址，后 32 字节为 amount
 //   - amount 按 uint256 从 data 解码，并通过 getTokenDecimals(contractAddr) 获取 decimals：
 //   - 优先使用业务注入的 TokenMetadataFunc(symbol, contractAddr)
 //   - 否则回退链上 ERC20Metadata(contractAddr)
 //   - decimals<=0 或查询失败时跳过该事件（绝不猜测默认 18）
 //   - 通过 ScanTargetFunc(contractAddr, fromToken/toToken) 判断代币归属的 AccountID：
-//   - from 命中：在该 SourceKey 下生成一条 From=[fromToken:amountStr], To=[toToken:amountStr] 的记录
-//   - to 命中：在该 SourceKey 下同样生成一条 From=[fromToken:amountStr], To=[toToken:amountStr] 的记录
-//     （两者 From/To 均完整填充，便于按 AccountID 维度独立入账）
+//   - from 命中：在该 SourceKey 下生成一条 FromAddr=[fromToken], FromAmt=[amountStr], ToAddr=[toToken], ToAmt=[amountStr] 的记录，TxAction="send"（内部转账则为"internal"）
+//   - to 命中：在该 SourceKey 下同样生成一条 FromAddr=[fromToken], FromAmt=[amountStr], ToAddr=[toToken], ToAmt=[amountStr] 的记录，TxAction="receive"
+//     （两者 From/To 均完整填充，通过 TxAction 区分方向，便于按 AccountID 维度独立入账）
 //   - Coin.Symbol = 主币符号（如 ETH）；Coin.IsContract = true
 //   - Coin.Contract 填充：Symbol=代币符号, Address=合约地址, Name=代币名称, Decimals=代币精度
 //   - Token 记录 Fees 始终为 "0"，手续费由 GAS 记录负责
-//   - 每条 Transfer 事件同时生成一条 SmartContractReceipt，key=txid:contractAddr:logIndex，用于 VerifyTransactionMatch 精确定位
+//   - 每条 Transfer 事件同时生成一条 SmartContractReceipt，key=txid:contractAddr:outputIndex，用于 VerifyTransactionMatch 精确定位
 //
 // 5. 聚合维度：
 //   - 返回值 ExtractData:  []*types.ExtractDataItem 按 SourceKey 聚合
-//   - ContractReceipts: []*types.ContractReceiptItem 带 key 字段（如 txid:contractAddr:logIndex）
-//   - 上层可按 SourceKey 维度扫描账务，也可按 txid+logIndex 做逐条严格比对
+//   - ContractReceipts: []*types.ContractReceiptItem 带 key 字段（如 txid:contractAddr:outputIndex）
+//   - 上层可按 SourceKey 维度扫描账务，也可按 txid+outputIndex 做逐条严格比对
 func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTargetFunc adaptscanner.BlockScanTargetFunc) ([]*types.ExtractDataItem, []*types.ContractReceiptItem, error) {
 	if bs.wm == nil || bs.wm.Client == nil {
 		return nil, nil, fmt.Errorf("wallet manager or rpc client is nil")
@@ -1568,6 +1622,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 
 	// 辅助函数：向 extractData 中添加数据，按 SourceKey 聚合
 	appendExtractData := func(sourceKey string, data *types.TxExtractData) {
+		// 严格校验：确保 Transaction 的地址和金额列表一一对应
+		if data.Transaction != nil {
+			if err := validateAddrAmtMatch(data.Transaction); err != nil {
+				// 数据不一致，打印错误并跳过该记录
+				fmt.Printf("[EthBlockScanner] validateAddrAmtMatch failed for %s: %v\n", data.Transaction.TxID, err)
+				return
+			}
+		}
 		for _, item := range extractData {
 			if item.SourceKey == sourceKey {
 				item.Data = append(item.Data, data)
@@ -1600,11 +1662,15 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      "0",
 				Decimal:     bs.wm.SymbolDecimal(),
 				Fees:        feeStr,
-				From:        []string{from + ":" + feeStr},
-				To:          []string{},
+			FromAddr:    []string{from},
+			FromAmt:     []string{feeStr},
+			ToAddr:      []string{},
+			ToAmt:       []string{},
 				Status:      status,
 				ConfirmTime: confirmTime,
 				FeeType:     "gas",
+				TxAction:    "fee", // 手续费记录
+				OutputIndex: -2,    // 手续费记录标记为 -2，与主币(-1)和合约事件(>=0)区分
 				ExtParam:    nil,
 			}
 			data := types.NewTxExtractData()
@@ -1626,14 +1692,58 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 
 		isContractCreation := actualTo == ""
 		var ext map[string]string
+		var createdAddr string
 		if isContractCreation {
-			ext = map[string]string{"contract_creation": "true"}
+			// 获取创建的合约地址（从回执中）
+			if rcRes != nil {
+				createdAddr = rcRes.Get("contractAddress").String()
+			}
+			ext = map[string]string{
+				"contract_creation": "true",
+				"contract_address":  createdAddr,
+			}
+
+			// 检查新创建的合约地址是否被监控（重要：合约创建时转入的 ETH 归属）
+			if createdAddr != "" {
+				createdParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, createdAddr)
+				createdRes := scanTargetFunc(createdParam)
+				if createdRes.Exist {
+					// 为创建的合约地址生成 receive 记录（入账）
+					txObj := &types.Transaction{
+						TxID:        txid,
+						AccountID:   createdRes.SourceKey,
+						Coin:        ethCoin,
+						BlockHash:   blockHash,
+						BlockHeight: blockHeight,
+						Amount:      amountStr,
+						Decimal:     bs.wm.SymbolDecimal(),
+						Fees:        "0",
+						FromAddr:    []string{from},
+						FromAmt:     []string{amountStr},
+						ToAddr:      []string{createdAddr},
+						ToAmt:       []string{amountStr},
+						Status:      status,
+						ConfirmTime: confirmTime,
+						TxAction:    "receive", // 合约创建时的 ETH 入账
+						OutputIndex: -1,
+						ExtParam:    ext,
+					}
+					data := types.NewTxExtractData()
+					data.Transaction = txObj
+					appendExtractData(createdRes.SourceKey, data)
+				}
+			}
 		}
 
 		fromParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, from)
 		fromRes := scanTargetFunc(fromParam)
 		if fromRes.Exist {
-			toListForFrom := []string{actualTo + ":" + amountStr}
+			// 判断是否为内部转账（双方属于同一账户）
+			isInternal := toResExist && toRes.SourceKey == fromRes.SourceKey
+			txAction := "send"
+			if isInternal {
+				txAction = "internal"
+			}
 			txObj := &types.Transaction{
 				TxID:        txid,
 				AccountID:   fromRes.SourceKey,
@@ -1643,10 +1753,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      amountStr,
 				Decimal:     bs.wm.SymbolDecimal(),
 				Fees:        "0",
-				From:        []string{from + ":" + amountStr},
-				To:          toListForFrom,
+			FromAddr:    []string{from},
+			FromAmt:     []string{amountStr},
+			ToAddr:      []string{actualTo},
+			ToAmt:       []string{amountStr},
 				Status:      status,
 				ConfirmTime: confirmTime,
+				TxAction:    txAction, // 转出或内部转账
+				OutputIndex: -1,       // 主币转账记录标记为 -1，与手续费(-2)和合约事件(>=0)区分
 				ExtParam:    ext,
 			}
 			data := types.NewTxExtractData()
@@ -1665,10 +1779,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 					Amount:      amountStr,
 					Decimal:     bs.wm.SymbolDecimal(),
 					Fees:        "0",
-					From:        []string{from + ":" + amountStr},
-					To:          []string{actualTo + ":" + amountStr},
+					FromAddr:    []string{from},
+					FromAmt:     []string{amountStr},
+					ToAddr:      []string{actualTo},
+					ToAmt:       []string{amountStr},
 					Status:      status,
 					ConfirmTime: confirmTime,
+					TxAction:    "receive", // 转入
+					OutputIndex: -1,        // 主币转账记录标记为 -1，与手续费(-2)和合约事件(>=0)区分
 					ExtParam:    ext,
 				}
 				data := types.NewTxExtractData()
@@ -1697,13 +1815,15 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 		var fromToken, toToken string
 		var tokenAmount *big.Int = big.NewInt(0)
 
+		// 标准 ERC-20 Transfer 格式：topics[1]=from, topics[2]=to, data=32字节amount
 		if len(topics) >= 3 {
 			fromToken = extractAddressFromTopic(topics[1].String())
 			toToken = extractAddressFromTopic(topics[2].String())
 			if fromToken != "" && toToken != "" {
 				if dataHex != "" && dataHex != "0x" {
-					if b, err := hexutil.Decode(dataHex); err == nil {
-						tokenAmount = new(big.Int).SetBytes(padTo32Bytes(b))
+					// 安全校验：严格检查 data 长度必须为 32 字节，防止恶意合约攻击
+					if b, err := hexutil.Decode(dataHex); err == nil && len(b) == 32 {
+						tokenAmount = new(big.Int).SetBytes(b)
 					}
 				}
 			}
@@ -1713,14 +1833,13 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				continue
 			}
 			if dataHex != "" && dataHex != "0x" {
-				if b, err := hexutil.Decode(dataHex); err == nil && len(b) >= 32 {
+				// 非标准格式：data 应包含 32 字节 to 地址 + 32 字节 amount = 64 字节
+				if b, err := hexutil.Decode(dataHex); err == nil && len(b) == 64 {
 					addrBytes := b[12:32]
 					if len(addrBytes) == 20 {
 						toToken = "0x" + strings.ToLower(hex.EncodeToString(addrBytes))
 					}
-					if len(b) >= 64 {
-						tokenAmount = new(big.Int).SetBytes(b[32:64])
-					}
+					tokenAmount = new(big.Int).SetBytes(b[32:64])
 				}
 			}
 		}
@@ -1755,7 +1874,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 		toParam := types.NewScanTargetParamForAddress(contractAddr, toToken)
 		toRes := scanTargetFunc(toParam)
 
+		// 判断是否为内部转账（双方属于同一账户）
+		isInternalToken := fromRes.Exist && toRes.Exist && fromRes.SourceKey == toRes.SourceKey
+
 		if fromRes.Exist {
+			txAction := "send"
+			if isInternalToken {
+				txAction = "internal"
+			}
 			txObj := &types.Transaction{
 				TxID:        txid,
 				AccountID:   fromRes.SourceKey,
@@ -1765,17 +1891,20 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      tokenAmountStr,
 				Decimal:     tokenDecimals,
 				Fees:        "0",
-				From:        []string{fromToken + ":" + tokenAmountStr},
-				To:          []string{toToken + ":" + tokenAmountStr},
+			FromAddr:    []string{fromToken},
+			FromAmt:     []string{tokenAmountStr},
+			ToAddr:      []string{toToken},
+			ToAmt:       []string{tokenAmountStr},
 				Status:      status,
 				ConfirmTime: confirmTime,
-				LogIndex:    int64(logIdx),
+				TxAction:    txAction, // 转出或内部转账
+				OutputIndex: int64(logIdx),
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
 			appendExtractData(fromRes.SourceKey, data)
 		}
-		if toRes.Exist {
+		if toRes.Exist && !isInternalToken {
 			txObj := &types.Transaction{
 				TxID:        txid,
 				AccountID:   toRes.SourceKey,
@@ -1785,11 +1914,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      tokenAmountStr,
 				Decimal:     tokenDecimals,
 				Fees:        "0",
-				From:        []string{fromToken + ":" + tokenAmountStr},
-				To:          []string{toToken + ":" + tokenAmountStr},
-				Status:      status,
-				ConfirmTime: confirmTime,
-				LogIndex:    int64(logIdx),
+			FromAddr:    []string{fromToken},
+					FromAmt:     []string{tokenAmountStr},
+					ToAddr:      []string{toToken},
+					ToAmt:       []string{tokenAmountStr},
+					Status:      status,
+					ConfirmTime: confirmTime,
+					TxAction:    "receive", // 转入
+					OutputIndex: int64(logIdx),
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
@@ -1809,12 +1941,24 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				BlockHash:   blockHash,
 				BlockHeight: blockHeight,
 				Status:      status,
-				LogIndex:    int64(logIdx),
+				OutputIndex: int64(logIdx),
 			},
 		})
 	}
 
 	return extractData, contractReceipts, nil
+}
+
+// validateAddrAmtMatch 校验地址和金额列表的长度匹配性
+// 确保 FromAddr/FromAmt 和 ToAddr/ToAmt 一一对应，避免数据不一致
+func validateAddrAmtMatch(tx *types.Transaction) error {
+	if len(tx.FromAddr) != len(tx.FromAmt) {
+		return fmt.Errorf("FromAddr/FromAmt length mismatch: %d vs %d", len(tx.FromAddr), len(tx.FromAmt))
+	}
+	if len(tx.ToAddr) != len(tx.ToAmt) {
+		return fmt.Errorf("ToAddr/ToAmt length mismatch: %d vs %d", len(tx.ToAddr), len(tx.ToAmt))
+	}
+	return nil
 }
 
 // findContractReceipt 在 ContractReceipts slice 中查找指定 key 的 receipt
@@ -1823,7 +1967,7 @@ func findContractReceipt(items []*types.ContractReceiptItem, key string) *types.
 		if item == nil {
 			continue
 		}
-		// 支持完整匹配或后缀匹配（兼容 txid:contract:logIndex 和 contract:logIndex 两种格式）
+		// 支持完整匹配或后缀匹配（兼容 txid:contract:outputIndex 和 contract:outputIndex 两种格式）
 		if item.Key == key || strings.HasSuffix(item.Key, key) || strings.HasSuffix(key, item.Key) {
 			return item.Receipt
 		}

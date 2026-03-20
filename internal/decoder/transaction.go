@@ -406,10 +406,29 @@ func (d *EthTransactionDecoder) SubmitRawTransaction(wrapper wallet.WalletDAI, r
 	rawTx.TxID = txid
 	rawTx.IsSubmit = true
 
+	// 构建 From/To 的地址和金额列表（解码器场景下地址和金额一一对应）
+	var fromAddr, fromAmt, toAddr, toAmt []string
+	for _, fromItem := range rawTx.TxFrom {
+		parts := strings.SplitN(fromItem, ":", 2)
+		fromAddr = append(fromAddr, parts[0])
+		if len(parts) > 1 {
+			fromAmt = append(fromAmt, parts[1])
+		}
+	}
+	for _, toItem := range rawTx.TxTo {
+		parts := strings.SplitN(toItem, ":", 2)
+		toAddr = append(toAddr, parts[0])
+		if len(parts) > 1 {
+			toAmt = append(toAmt, parts[1])
+		}
+	}
+
 	return &types.Transaction{
 		TxID:      txid,
-		From:      rawTx.TxFrom,
-		To:        rawTx.TxTo,
+		FromAddr:  fromAddr,
+		FromAmt:   fromAmt,
+		ToAddr:    toAddr,
+		ToAmt:     toAmt,
 		Amount:    rawTx.TxAmount,
 		Coin:      rawTx.Coin,
 		AccountID: rawTx.Account.AccountID,

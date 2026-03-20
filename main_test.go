@@ -290,16 +290,14 @@ found:
 				continue
 			}
 			// 主币 value=0 的交易不会产生交易单，这里拿到的应该都有 amount
-			if len(tx.From) > 0 {
-				parts := strings.SplitN(tx.From[0], ":", 2)
-				from = strings.ToLower(parts[0])
-				if len(parts) == 2 {
-					amountStr = parts[1]
+			if len(tx.FromAddr) > 0 {
+				from = strings.ToLower(tx.FromAddr[0])
+				if len(tx.FromAmt) > 0 {
+					amountStr = tx.FromAmt[0]
 				}
 			}
-			if len(tx.To) > 0 {
-				parts := strings.SplitN(tx.To[0], ":", 2)
-				to = strings.ToLower(parts[0])
+			if len(tx.ToAddr) > 0 {
+				to = strings.ToLower(tx.ToAddr[0])
 			}
 			if amountStr == "" {
 				amountStr = tx.Amount
@@ -319,7 +317,7 @@ found:
 		BlockHash: chain.BlockHash,
 		Height:    chain.BlockHeight,
 		Transfers: []*types.TxTransferExpected{
-			{ContractAddr: "", From: from, To: to, Amount: amountStr, Decimals: 0, LogIndex: -1},
+			{ContractAddr: "", From: from, To: to, Amount: amountStr, Decimals: 0, OutputIndex: -1},
 		},
 	}
 
