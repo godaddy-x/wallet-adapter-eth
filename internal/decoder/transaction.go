@@ -86,7 +86,11 @@ func (d *EthTransactionDecoder) EstimateRawTransactionFee(wrapper wallet.WalletD
 	if rawTx.Account == nil {
 		return types.Errorf(types.ErrCreateRawTransactionFailed, "account is nil")
 	}
-	addresses, _, err := wrapper.GetAddressList(false, 0, 1, "AccountID", rawTx.Account.AccountID)
+	addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
+		LastID:    0,
+		Limit:     1,
+		AccountID: rawTx.Account.AccountID,
+	})
 	if err != nil || len(addresses) == 0 {
 		return types.Errorf(types.ErrAddressNotFound, "no address for account")
 	}
@@ -128,7 +132,11 @@ func (d *EthTransactionDecoder) createSimpleRawTransaction(wrapper wallet.Wallet
 	// 分页查询地址，每页内检查余额，找到足够余额的地址即返回，避免一次拉取全部
 	var lastID int64 = 0
 	for {
-		addresses, _, err := wrapper.GetAddressList(false, lastID, addressListPageSize, "AccountID", accountID)
+		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
+			LastID:    lastID,
+			Limit:     addressListPageSize,
+			AccountID: accountID,
+		})
 		if err != nil {
 			return types.NewError(types.ErrAddressNotFound, err.Error())
 		}
@@ -208,7 +216,11 @@ func (d *EthTransactionDecoder) createErc20RawTransaction(wrapper wallet.WalletD
 	lastID := int64(0)
 	var errTokenBalance, errBalance string
 	for {
-		addresses, _, err := wrapper.GetAddressList(false, lastID, addressListPageSize, "AccountID", rawTx.Account.AccountID)
+		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
+			LastID:    lastID,
+			Limit:     addressListPageSize,
+			AccountID: rawTx.Account.AccountID,
+		})
 		if err != nil {
 			return types.NewError(types.ErrAddressNotFound, err.Error())
 		}
@@ -276,7 +288,7 @@ func (d *EthTransactionDecoder) buildRawTransaction(wrapper wallet.WalletDAI, ra
 	rawTx.Fees = util.BigIntToDecimal(fee.Fee, d.Wm.SymbolDecimal())
 	rawTx.TxAmount = amountStr
 
-	addr, err := wrapper.GetAddress(ab.Address)
+	addr, err := wrapper.GetAddress(wallet.SearchParams{Address: ab.Address})
 	if err != nil {
 		return types.NewError(types.ErrAddressNotFound, err.Error())
 	}
@@ -517,7 +529,10 @@ func (d *EthTransactionDecoder) createNativeSummaryRawTransaction(wrapper wallet
 	lastID := sumRawTx.AddressStartIndex
 
 	// 首次 countQ 查询总数，用于估算分页大小，减少地址很多时的内存扩容与分页次数
-	_, total, err := wrapper.GetAddressList(true, 0, 0, "AccountID", sumRawTx.Account.AccountID)
+	_, total, err := wrapper.GetAddressList(wallet.SearchParams{
+		CountQ:    true,
+		AccountID: sumRawTx.Account.AccountID,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -544,7 +559,11 @@ func (d *EthTransactionDecoder) createNativeSummaryRawTransaction(wrapper wallet
 			curLimit = remaining
 		}
 
-		addresses, _, err := wrapper.GetAddressList(false, lastID, curLimit, "AccountID", sumRawTx.Account.AccountID)
+		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
+			LastID:    lastID,
+			Limit:     curLimit,
+			AccountID: sumRawTx.Account.AccountID,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -621,7 +640,10 @@ func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.
 	lastID := sumRawTx.AddressStartIndex
 
 	// 首次 countQ 查询总数，用于估算分页大小，减少地址很多时的内存扩容与分页次数
-	_, total, err := wrapper.GetAddressList(true, 0, 0, "AccountID", sumRawTx.Account.AccountID)
+	_, total, err := wrapper.GetAddressList(wallet.SearchParams{
+		CountQ:    true,
+		AccountID: sumRawTx.Account.AccountID,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -649,7 +671,11 @@ func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.
 			curLimit = remaining
 		}
 
-		addresses, _, err := wrapper.GetAddressList(false, lastID, curLimit, "AccountID", sumRawTx.Account.AccountID)
+		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
+			LastID:    lastID,
+			Limit:     curLimit,
+			AccountID: sumRawTx.Account.AccountID,
+		})
 		if err != nil {
 			return nil, err
 		}
