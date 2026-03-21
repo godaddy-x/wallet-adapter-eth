@@ -1380,7 +1380,6 @@ func (bs *EthBlockScanner) GetBalanceByAddress(address ...string) ([]*types.Bala
 	return bs.Base.QueryBalancesConcurrent(bs.wm.Config.Symbol, address, queryFunc, concurrency)
 }
 
-
 // getBlockTimestamp 根据 blockHash 获取区块时间戳（秒），并做本地缓存。
 // fallback 用于 RPC 失败或节点返回异常数据时兜底（不做硬失败，保证扫描可继续）。
 func (bs *EthBlockScanner) getBlockTimestamp(blockHash string, fallback int64) int64 {
@@ -1465,9 +1464,9 @@ func extractAddressFromTopic(topic string) string {
 //   - 若归属不同 SourceKey：from 账户生成出账记录（TxAction="send"），to 账户生成入账记录（TxAction="receive"）
 //   - 主币记录 Fees="0"，OutputIndex=-1，手续费统一通过 GAS 记录归集
 //   - 若 to 为空（合约创建）：
-//     * ExtParam["contract_creation"]="true"，ExtParam["contract_address"]=创建的合约地址
-//     * 为发送方生成 TxAction="send" 的支出记录
-//     * 如果创建的合约地址被监控，额外为其生成 TxAction="receive" 的入账记录（确保合约创建时转入的 ETH 被正确归属）
+//   - ExtParam["contract_creation"]="true"，ExtParam["contract_address"]=创建的合约地址
+//   - 为发送方生成 TxAction="send" 的支出记录
+//   - 如果创建的合约地址被监控，额外为其生成 TxAction="receive" 的入账记录（确保合约创建时转入的 ETH 被正确归属）
 //
 // 3. 手续费（GAS）：
 //   - 手续费按 gasUsed * effectiveGasPrice（receipt 中优先，fallback 到 tx.gasPrice）计算为 feeWei，并按 SymbolDecimal() 格式化为 feeStr
@@ -1484,9 +1483,9 @@ func extractAddressFromTopic(topic string) string {
 // 4. ERC20 代币（Token）：
 //   - 从回执 logs 中筛选标准 ERC20 Transfer 事件（topic0 固定为 Transfer(address,address,uint256)）
 //   - Case1（标准）：topics[1]=from, topics[2]=to, data=32字节amount
-//     * 安全校验：严格检查 data 长度必须为 32 字节，拒绝恶意合约的非标准事件
+//   - 安全校验：严格检查 data 长度必须为 32 字节，拒绝恶意合约的非标准事件
 //   - Case2（非标准）：topics[1]=from, data=64字节（32字节to地址+32字节amount）
-//     * 安全校验：严格检查 data 长度必须为 64 字节
+//   - 安全校验：严格检查 data 长度必须为 64 字节
 //   - 通过 extractAddressFromTopic 从 32 字节 topic 中提取地址
 //   - amount 按 uint256 从 data 解码，并通过 getTokenDecimals(contractAddr) 获取 decimals：
 //   - 优先使用业务注入的 TokenMetadataFunc(symbol, contractAddr)
@@ -1662,10 +1661,10 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      "0",
 				Decimal:     bs.wm.SymbolDecimal(),
 				Fees:        feeStr,
-			FromAddr:    []string{from},
-			FromAmt:     []string{feeStr},
-			ToAddr:      []string{},
-			ToAmt:       []string{},
+				FromAddr:    []string{from},
+				FromAmt:     []string{feeStr},
+				ToAddr:      []string{},
+				ToAmt:       []string{},
 				Status:      status,
 				ConfirmTime: confirmTime,
 				FeeType:     "gas",
@@ -1753,10 +1752,10 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      amountStr,
 				Decimal:     bs.wm.SymbolDecimal(),
 				Fees:        "0",
-			FromAddr:    []string{from},
-			FromAmt:     []string{amountStr},
-			ToAddr:      []string{actualTo},
-			ToAmt:       []string{amountStr},
+				FromAddr:    []string{from},
+				FromAmt:     []string{amountStr},
+				ToAddr:      []string{actualTo},
+				ToAmt:       []string{amountStr},
 				Status:      status,
 				ConfirmTime: confirmTime,
 				TxAction:    txAction, // 转出或内部转账
@@ -1859,13 +1858,12 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			Symbol:     bs.wm.Config.Symbol,
 			IsContract: true,
 			Contract: types.SmartContract{
-				ContractID: "",
-				Symbol:     "",
-				Address:    contractAddr,
-				Token:      "",
-				Protocol:   "",
-				Name:       "",
-				Decimals:   uint64(tokenDecimals),
+				Symbol:   "",
+				Address:  contractAddr,
+				Token:    "",
+				Protocol: "",
+				Name:     "",
+				Decimals: uint64(tokenDecimals),
 			},
 		}
 
@@ -1891,10 +1889,10 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      tokenAmountStr,
 				Decimal:     tokenDecimals,
 				Fees:        "0",
-			FromAddr:    []string{fromToken},
-			FromAmt:     []string{tokenAmountStr},
-			ToAddr:      []string{toToken},
-			ToAmt:       []string{tokenAmountStr},
+				FromAddr:    []string{fromToken},
+				FromAmt:     []string{tokenAmountStr},
+				ToAddr:      []string{toToken},
+				ToAmt:       []string{tokenAmountStr},
 				Status:      status,
 				ConfirmTime: confirmTime,
 				TxAction:    txAction, // 转出或内部转账
@@ -1914,14 +1912,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				Amount:      tokenAmountStr,
 				Decimal:     tokenDecimals,
 				Fees:        "0",
-			FromAddr:    []string{fromToken},
-					FromAmt:     []string{tokenAmountStr},
-					ToAddr:      []string{toToken},
-					ToAmt:       []string{tokenAmountStr},
-					Status:      status,
-					ConfirmTime: confirmTime,
-					TxAction:    "receive", // 转入
-					OutputIndex: int64(logIdx),
+				FromAddr:    []string{fromToken},
+				FromAmt:     []string{tokenAmountStr},
+				ToAddr:      []string{toToken},
+				ToAmt:       []string{tokenAmountStr},
+				Status:      status,
+				ConfirmTime: confirmTime,
+				TxAction:    "receive", // 转入
+				OutputIndex: int64(logIdx),
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj

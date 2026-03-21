@@ -76,17 +76,12 @@ func (d *EthSmartContractDecoder) GetTokenMetadata(contractAddr string) (*types.
 	if err != nil {
 		return nil, err
 	}
-	contractID := contractAddr
-	if d.Wm.Config != nil && d.Wm.Config.Symbol != "" {
-		contractID = d.Wm.Config.Symbol + "_" + contractAddr
-	}
 	sc := &types.SmartContract{
-		ContractID: contractID,
-		Symbol:     d.Wm.Config.Symbol,
-		Address:    contractAddr,
-		Token:      symbol,
-		Name:       name,
-		Decimals:   uint64(decimals),
+		Symbol:   d.Wm.Config.Symbol,
+		Address:  contractAddr,
+		Token:    symbol,
+		Name:     name,
+		Decimals: uint64(decimals),
 	}
 	return sc, nil
 }
