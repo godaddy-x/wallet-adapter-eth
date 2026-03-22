@@ -59,24 +59,15 @@ func (c *WalletConfig) MakeDataDir() {
 	c.DataDir = filepath.Join(c.DataDir, strings.ToLower(c.Symbol))
 }
 
-// trimQuoted 去掉首尾空格及可选的成对双引号，避免 INI 中 "E://test/"、"http://..." 等带引号值解析异常。
-func trimQuoted(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		s = s[1 : len(s)-1]
-	}
-	return strings.TrimSpace(s)
-}
-
 // BuildConfigFromConfiger 从 github.com/godaddy-x/wallet-adapter 的 Configer 读取并填充 WalletConfig，symbol 作为链标识。
 func BuildConfigFromConfiger(c adapterconfig.Configer, symbol string) *WalletConfig {
 	cfg := NewConfig(symbol)
-	cfg.ServerAPI = trimQuoted(c.String("serverAPI"))
-	cfg.BroadcastAPI = trimQuoted(c.String("broadcastAPI"))
+	cfg.ServerAPI = c.String("serverAPI")
+	cfg.BroadcastAPI = c.String("broadcastAPI")
 	if cfg.BroadcastAPI == "" {
 		cfg.BroadcastAPI = cfg.ServerAPI
 	}
-	cfg.DataDir = trimQuoted(c.String("dataDir"))
+	cfg.DataDir = c.String("dataDir")
 	if v := c.String("chainID"); v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 			cfg.ChainID = n
