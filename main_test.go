@@ -16,21 +16,22 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// testIniContent 为本仓库本地节点集成测试的通用配置。
+// testConfigJSON 为本仓库本地节点集成测试的通用 JSON 配置。
 // 如需切换节点端口/数据目录，只需修改此处。
-const testIniContent = `[ETH]
-serverAPI = http://127.0.0.1:8547
-broadcastAPI = http://127.0.0.1:8547
-fixGasLimit =
-dataDir = E://test/
-fixGasPrice =
-offsetsGasPrice = 0
-nonceComputeMode = 0
-useQNSingleFlightRPC = 0
-detectUnknownContracts = 0
-moralisAPIKey =
-moralisAPIChain = eth
-useMoralisAPIParseBlock = 0`
+const testConfigJSON = `{
+  "serverAPI": "http://127.0.0.1:8547",
+  "broadcastAPI": "http://127.0.0.1:8547",
+  "fixGasLimit": "",
+  "dataDir": "E://test/",
+  "fixGasPrice": "",
+  "offsetsGasPrice": "0",
+  "nonceComputeMode": "0",
+  "useQNSingleFlightRPC": "0",
+  "detectUnknownContracts": "0",
+  "moralisAPIKey": "",
+  "moralisAPIChain": "eth",
+  "useMoralisAPIParseBlock": "0"
+}`
 
 const testHeight = 83156
 const testHeightToken = 88356
@@ -42,10 +43,10 @@ const testHeightToken = 88356
 // - 实际连本地节点：获取 latest 区块头并执行一次 ScanBlock，验证扫块流程可跑通。
 func TestStartBlockScanner(t *testing.T) {
 	// 复用 main.go 中的 demo 配置（本地节点地址可按需要调整）
-	const iniContent = testIniContent
+	const configJSON = testConfigJSON
 
 	// 创建适配器（内部会构造 EthBlockScanner，但此时尚未设置 ScanTargetFunc 与 TokenMetadataFunc）
-	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	adapter, err := eth.NewAdapter(configJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
 	}
@@ -90,11 +91,11 @@ func TestStartBlockScanner(t *testing.T) {
 }
 
 // TestScanBlockWithResultFlow 验证 ScanBlockWithResult 的同步扫块流程与块内并行提取逻辑可正常工作。
-// 该用例依赖本地节点可用（使用与 TestStartBlockScanner 相同的 INI 配置）。
+// 该用例依赖本地节点可用（使用与 TestStartBlockScanner 相同的 JSON 配置）。
 func TestScanBlockWithResultFlow(t *testing.T) {
-	const iniContent = testIniContent
+	const configJSON = testConfigJSON
 
-	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	adapter, err := eth.NewAdapter(configJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
 	}
@@ -155,9 +156,9 @@ func TestScanBlockWithResultFlow(t *testing.T) {
 
 // TestVerifyTransactionByTxID 从 latest 区块取一笔 tx 进行链上复核，验证 VerifyTransactionByTxID 可跑通并返回结果集结构。
 func TestVerifyTransactionByTxID(t *testing.T) {
-	const iniContent = testIniContent
+	const configJSON = testConfigJSON
 
-	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	adapter, err := eth.NewAdapter(configJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
 	}
@@ -217,9 +218,9 @@ func TestVerifyTransactionByTxID(t *testing.T) {
 }
 
 func TestVerifyTransactionMatch(t *testing.T) {
-	const iniContent = testIniContent
+	const configJSON = testConfigJSON
 
-	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	adapter, err := eth.NewAdapter(configJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
 	}
@@ -333,9 +334,9 @@ found:
 
 // TestScanBlockOnce 测试“指定高度补扫一次”的能力（不进入持续循环）。
 func TestScanBlockOnce(t *testing.T) {
-	const iniContent = testIniContent
+	const configJSON = testConfigJSON
 
-	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	adapter, err := eth.NewAdapter(configJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
 	}
@@ -389,9 +390,9 @@ func TestScanBlockOnce(t *testing.T) {
 
 // TestScanBlockOnce 测试“指定高度补扫一次”的能力（不进入持续循环）。
 func TestScanBlockOnceToken(t *testing.T) {
-	const iniContent = testIniContent
+	const configJSON = testConfigJSON
 
-	adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+	adapter, err := eth.NewAdapter(configJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
 	}
@@ -444,7 +445,7 @@ func TestScanBlockOnceToken(t *testing.T) {
 }
 
 func TestRunScanLoopContinuously(t *testing.T) {
-	adapter, err := eth.NewAdapter(testIniContent, "ETH", "Ethereum", 18)
+	adapter, err := eth.NewAdapter(testConfigJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
 	}

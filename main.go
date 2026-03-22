@@ -1,4 +1,4 @@
-// main 为本模块 (github.com/godaddy-x/wallet-adapter-eth) 的测试入口：从内嵌 INI 通过 eth.NewAdapter 创建并注册适配器，打印链信息与可选地址余额/nonce 后阻塞运行。可选 -addr 指定测试地址。
+// main 为本模块 (github.com/godaddy-x/wallet-adapter-eth) 的测试入口：从内嵌 JSON 配置通过 eth.NewAdapter 创建并注册适配器，打印链信息与可选地址余额/nonce 后阻塞运行。可选 -addr 指定测试地址。
 package main
 
 import (
@@ -13,19 +13,20 @@ import (
 )
 
 var (
-	configContent = `[ETH]
-serverAPI = http://127.0.0.1:8547
-broadcastAPI = http://127.0.0.1:8547
-fixGasLimit =
-dataDir = E://test/
-fixGasPrice =
-offsetsGasPrice = 0
-nonceComputeMode = 0
-useQNSingleFlightRPC = 0
-detectUnknownContracts = 0
-moralisAPIKey =
-moralisAPIChain = eth
-useMoralisAPIParseBlock = 0`
+	configContent = `{
+  "serverAPI": "http://127.0.0.1:8547",
+  "broadcastAPI": "http://127.0.0.1:8547",
+  "fixGasLimit": "",
+  "dataDir": "E://test/",
+  "fixGasPrice": "",
+  "offsetsGasPrice": "0",
+  "nonceComputeMode": "0",
+  "useQNSingleFlightRPC": "0",
+  "detectUnknownContracts": "0",
+  "moralisAPIKey": "",
+  "moralisAPIChain": "eth",
+  "useMoralisAPIParseBlock": "0"
+}`
 )
 
 var testAddr = flag.String("addr", "0x301db155664284b1462e1a10c082a9ff6e2b617f", "optional: test address for balance/nonce")

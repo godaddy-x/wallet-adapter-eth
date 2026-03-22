@@ -1,4 +1,4 @@
-// Module github.com/godaddy-x/wallet-adapter-eth：以太坊及 EVM 兼容链的 wallet-adapter 子类，提供 ChainAdapter、TransactionDecoder、AddressDecoder、SmartContractDecoder 及 LoadAssetsConfig/INI 配置。
+// Module github.com/godaddy-x/wallet-adapter-eth：以太坊及 EVM 兼容链的 wallet-adapter 子类，提供 ChainAdapter、TransactionDecoder、AddressDecoder、SmartContractDecoder 及 LoadAssetsConfig 配置（支持 JSON/INI 等多种格式）。
 module github.com/godaddy-x/wallet-adapter-eth
 
 go 1.26

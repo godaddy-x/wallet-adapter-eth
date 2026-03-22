@@ -1,4 +1,4 @@
-// Package config 提供本适配器使用的链配置（EVM 系：RPC、Gas、Nonce 等），依赖 github.com/godaddy-x/wallet-adapter/config 的 Configer 与 INI 解析。
+// Package config 提供本适配器使用的链配置（EVM 系：RPC、Gas、Nonce 等），依赖 github.com/godaddy-x/wallet-adapter/config 的 Configer 接口。
 package config
 
 import (
@@ -60,6 +60,7 @@ func (c *WalletConfig) MakeDataDir() {
 }
 
 // BuildConfigFromConfiger 从 github.com/godaddy-x/wallet-adapter 的 Configer 读取并填充 WalletConfig，symbol 作为链标识。
+// 该方法通过 Configer 接口读取配置，支持 JSON/INI 等多种格式（由 wallet-adapter/config 包定义）。
 func BuildConfigFromConfiger(c adapterconfig.Configer, symbol string) *WalletConfig {
 	cfg := NewConfig(symbol)
 	cfg.ServerAPI = c.String("serverAPI")
@@ -88,6 +89,7 @@ func BuildConfigFromConfiger(c adapterconfig.Configer, symbol string) *WalletCon
 }
 
 // BuildConfigFromKV 根据 key=value 映射构建 WalletConfig（section 作为 symbol）。
+// 该方法通过 MapConfig 将 map 转为 Configer，再调用 BuildConfigFromConfiger。
 func BuildConfigFromKV(kv map[string]string, section string) *WalletConfig {
 	return BuildConfigFromConfiger(adapterconfig.MapConfig(kv), section)
 }

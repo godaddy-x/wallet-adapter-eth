@@ -1,16 +1,22 @@
 package eth
 
 import (
+	"encoding/json"
 	"fmt"
 
-	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
 	"github.com/godaddy-x/wallet-adapter/chain"
+	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
 )
 
-// NewAdapter 从 INI 内容创建并注册适配器，通过 LoadAssetsConfig 初始化配置与 RPC 客户端后返回。依赖 github.com/godaddy-x/wallet-adapter/config 与 chain。
-func NewAdapter(iniContent, symbol, fullName string, decimals int32) (*EthAdapter, error) {
-	kv, err := adapterconfig.KVFromINIContent(iniContent, symbol)
-	if err != nil {
+// NewAdapter 从 JSON 字符串创建并注册适配器，通过 LoadAssetsConfig 初始化配置与 RPC 客户端后返回。
+// 该接口使用 github.com/godaddy-x/wallet-adapter/config 的 MapConfig 解析 JSON 配置。
+// jsonContent: JSON 格式的配置字符串（包含 serverAPI、broadcastAPI、dataDir 等字段）
+// symbol: 链标识，如 ETH、BSC
+// fullName: 链全称，如 Ethereum、Binance Smart Chain
+// decimals: 链原生币精度，如 18
+func NewAdapter(jsonContent, symbol, fullName string, decimals int32) (*EthAdapter, error) {
+	kv := adapterconfig.MapConfig{}
+	if err := json.Unmarshal([]byte(jsonContent), &kv); err != nil {
 		return nil, err
 	}
 

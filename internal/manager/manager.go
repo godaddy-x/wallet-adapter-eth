@@ -4,14 +4,14 @@ package manager
 import (
 	"math/big"
 
-	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/config"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/models"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/rpc"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/util"
+	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
 	"github.com/godaddy-x/wallet-adapter/types"
 	"github.com/godaddy-x/wallet-adapter/wallet"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 )
 
 // WalletManager 以太坊链能力聚合：RPC、nonce、gas、余额、广播（供 TransactionDecoder 使用）

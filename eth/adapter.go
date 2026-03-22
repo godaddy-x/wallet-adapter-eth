@@ -7,8 +7,8 @@ import (
 	"github.com/godaddy-x/wallet-adapter-eth/internal/config"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/decoder"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/manager"
-	ethscanner "github.com/godaddy-x/wallet-adapter-eth/internal/scanner"
 	"github.com/godaddy-x/wallet-adapter-eth/internal/rpc"
+	ethscanner "github.com/godaddy-x/wallet-adapter-eth/internal/scanner"
 	"github.com/godaddy-x/wallet-adapter/chain"
 	adapterconfig "github.com/godaddy-x/wallet-adapter/config"
 	"github.com/godaddy-x/wallet-adapter/scanner"
@@ -97,7 +97,7 @@ func (a *EthAdapter) GetSmartContractDecoder() adapter.SmartContractDecoder {
 }
 
 // LoadAssetsConfig 从外部配置回调加载并应用参数（如 serverAPI、broadcastAPI、chainID、gas、nonce 策略等）。
-// cfg 可为实现 github.com/godaddy-x/wallet-adapter/config.Configer 的对象（如 INI section），或 map[string]string（key 小写匹配）。
+// cfg 可为实现 github.com/godaddy-x/wallet-adapter/config.Configer 接口的对象（支持 JSON/INI 等格式），或 map[string]string（key 小写匹配）。
 // 委托 wm.LoadAssetsConfig 更新 Config、MakeDataDir、并初始化 RPC 客户端；未配 chainID 时从节点拉取。
 func (a *EthAdapter) LoadAssetsConfig(cfg interface{}) error {
 	var c adapterconfig.Configer
@@ -112,7 +112,7 @@ func (a *EthAdapter) LoadAssetsConfig(cfg interface{}) error {
 	return a.wm.LoadAssetsConfig(c)
 }
 
-// InitAssetsConfig 返回默认配置占位，供框架合并或展示；实际配置建议通过 INI + LoadAssetsConfig 或 NewAdapter(iniContent, ...) 提供。
+// InitAssetsConfig 返回默认配置占位，供框架合并或展示；实际配置建议通过 JSON/INI + LoadAssetsConfig 或 NewAdapter(jsonContent, ...) 提供。
 func (a *EthAdapter) InitAssetsConfig() (interface{}, error) {
 	return map[string]string{}, nil
 }

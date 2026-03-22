@@ -2,12 +2,12 @@
 
 **模块路径**：`github.com/godaddy-x/wallet-adapter-eth`
 
-以太坊及 EVM 兼容链的 [wallet-adapter](https://github.com/godaddy-x/wallet-adapter) 子类实现，为 BSC、Polygon、Arbitrum 等提供统一 ChainAdapter。支持原生币与 ERC20 建单、EIP-155 签名、原始交易广播，可与外部 MPC 签名服务配合使用；配置通过 LoadAssetsConfig 回调或 INI 注入。
+以太坊及 EVM 兼容链的 [wallet-adapter](https://github.com/godaddy-x/wallet-adapter) 子类实现，为 BSC、Polygon、Arbitrum 等提供统一 ChainAdapter。支持原生币与 ERC20 建单、EIP-155 签名、原始交易广播，可与外部 MPC 签名服务配合使用；配置通过 LoadAssetsConfig 回调传入，支持 wallet-adapter/config 定义的多种格式（JSON/INI 等）。
 
 ## 概述
 
 - **基础框架**：[wallet-adapter](https://github.com/godaddy-x/wallet-adapter) 的 `ChainAdapter`（SymbolInfo、AssetsConfig、TransactionDecoder、BlockScanner、AddressDecoder）。
-- **实现要点**：使用 github.com/godaddy-x/wallet-adapter 的 `types.RawTransaction`、`wallet.WalletDAI` 等；实现 `decoder.TransactionDecoder`、`decoder.AddressDecoder`、`decoder.SmartContractDecoder`；EVM 链配置（WalletConfig）在 internal/config，通用 Configer 与 INI 解析使用 github.com/godaddy-x/wallet-adapter/config。
+- **实现要点**：使用 github.com/godaddy-x/wallet-adapter 的 `types.RawTransaction`、`wallet.WalletDAI` 等；实现 `decoder.TransactionDecoder`、`decoder.AddressDecoder`、`decoder.SmartContractDecoder`；EVM 链配置（WalletConfig）在 internal/config，通过 wallet-adapter/config 的 Configer 接口加载，支持 JSON/INI 等多种格式。
 
 ## 项目结构（按功能划分 package）
 
@@ -15,17 +15,17 @@
 wallet-adapter-eth/
 ├── go.mod
 ├── go.sum
-├── main.go              # 入口（从 INI 文本一行启动）
+├── main.go              # 入口（从 JSON 配置一行启动）
 ├── README.md
 ├── LICENSE
 ├── resource/
-│   └── config.ini       # 示例配置
+│   └── config.json      # 示例配置（JSON 格式）
 ├── eth/                 # 对外包：适配器与一行启动
 │   ├── doc.go
 │   ├── adapter.go       # EthAdapter、NewEthAdapter
-│   └── run.go           # NewAdapter(iniContent, symbol, fullName, decimals)
+│   └── run.go           # NewAdapter(jsonContent, symbol, fullName, decimals)
 └── internal/            # 内部包（仅本模块使用）
-    ├── config/          # WalletConfig（EVM）、BuildConfigFromConfiger（依赖 github.com/godaddy-x/wallet-adapter/config）
+    ├── config/          # WalletConfig（EVM）、BuildConfigFromConfiger（使用 wallet-adapter/config 的 Configer 接口）
     ├── decoder/         # AddressDecoder、TransactionDecoder、SmartContractDecoder（对应 github.com/godaddy-x/wallet-adapter/decoder）
     │   ├── address.go
     │   ├── transaction.go
@@ -44,21 +44,22 @@ wallet-adapter-eth/
 ## 依赖
 
 - Go 1.26+
-- [github.com/godaddy-x/wallet-adapter](https://github.com/godaddy-x/wallet-adapter)（含 config 包：Configer、MapConfig、INI 解析；本地开发可用 replace 指向 `../wallet-adapter`）
+- [github.com/godaddy-x/wallet-adapter](https://github.com/godaddy-x/wallet-adapter)（提供 Configer 接口、MapConfig 实现及配置解析能力；本地开发可用 replace 指向 `../wallet-adapter`）
 - [github.com/ethereum/go-ethereum](https://github.com/ethereum/go-ethereum)
 - [github.com/imroc/req](https://github.com/imroc/req)、[github.com/tidwall/gjson](https://github.com/tidwall/gjson)
 
 ## 使用方式
 
-### 1. 一行启动（从 INI 内容创建并注册适配器）
+### 1. 一行启动（从 JSON 内容创建并注册适配器）
 
 ```go
 import (
     "github.com/godaddy-x/wallet-adapter-eth/eth"
 )
 
-// iniContent 可为从文件读取的 INI 文本，或直接写死的配置字符串（见 main.go）
-adapter, err := eth.NewAdapter(iniContent, "ETH", "Ethereum", 18)
+// jsonContent 为 JSON 格式的配置字符串，通过 wallet-adapter/config 的 MapConfig 解析
+// 支持字段：serverAPI、broadcastAPI、dataDir、chainID、fixGasLimit、fixGasPrice 等
+adapter, err := eth.NewAdapter(jsonContent, "ETH", "Ethereum", 18)
 if err != nil {
     return err
 }
@@ -134,40 +135,40 @@ func registerEvmChains() {
 
 ## 当前能力
 
-| 能力 | 说明 |
-|------|------|
-| 原生 ETH 转账 | CreateRawTransaction / SubmitRawTransaction / VerifyRawTransaction |
-| ERC20 转账 | CreateRawTransaction（IsContract 时建 transfer 单）/ SubmitRawTransaction / VerifyRawTransaction |
-| 费率 | GetRawTransactionFeeRate、EstimateRawTransactionFee |
-| 汇总 | CreateSummaryRawTransactionWithError（仅原生币） |
-| 地址 | AddressDecode / AddressEncode / AddressVerify、PublicKeyToAddress（EVM 0x+20 字节） |
-| MPC 签名 | 支持 64 字节 R\|S 转 65 字节 R\|S\|V，EIP-155 chainId |
-| BlockScanner | 暂未实现（返回 nil），可按需扩展 |
+| 能力          | 说明                                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| 原生 ETH 转账 | CreateRawTransaction / SubmitRawTransaction / VerifyRawTransaction                               |
+| ERC20 转账    | CreateRawTransaction（IsContract 时建 transfer 单）/ SubmitRawTransaction / VerifyRawTransaction |
+| 费率          | GetRawTransactionFeeRate、EstimateRawTransactionFee                                              |
+| 汇总          | CreateSummaryRawTransactionWithError（仅原生币）                                                 |
+| 地址          | AddressDecode / AddressEncode / AddressVerify、PublicKeyToAddress（EVM 0x+20 字节）              |
+| MPC 签名      | 支持 64 字节 R\|S 转 65 字节 R\|S\|V，EIP-155 chainId                                            |
+| BlockScanner  | 暂未实现（返回 nil），可按需扩展                                                                 |
 
-## 本地测试（main + INI）
+## 本地测试（main + JSON）
 
-根目录 `main.go` 内置 INI 示例并阻塞运行，可选 `-addr` 测试指定地址的余额与 nonce：
+根目录 `main.go` 内置 JSON 示例并阻塞运行，可选 `-addr` 测试指定地址的余额与 nonce：
 
 ```bash
-# 直接运行（使用代码内嵌 INI）
+# 直接运行（使用代码内嵌 JSON 配置）
 go run .
 
 # 带地址时打印该地址余额和 nonce
 go run . -addr 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
 ```
 
-更多 INI 示例见 `resource/config.ini`，需在 `[ETH]` 段配置 `serverAPI`、`broadcastAPI` 等。
+JSON 配置示例见 `resource/config.json`，需配置 `serverAPI`、`broadcastAPI`、`dataDir` 等字段。
 
 ## 文档与包说明
 
-| 位置 | 说明 |
-|------|------|
-| 本 README | 项目概述、结构、依赖、使用方式与能力表 |
-| eth/doc.go | 对外包 eth 的包文档与使用示例 |
-| internal/config | EVM WalletConfig、BuildConfigFromConfiger（依赖 github.com/godaddy-x/wallet-adapter/config） |
-| internal/manager | WalletManager、LoadAssetsConfig、RPC/余额/广播 |
-| internal/decoder | AddressDecoder、TransactionDecoder、SmartContractDecoder（EVM/ERC20/ERC20 代币余额与元数据） |
-| internal/rpc、models、util | JSON-RPC 客户端、内部模型、精度与地址工具 |
+| 位置                       | 说明                                                                                         |
+| -------------------------- | -------------------------------------------------------------------------------------------- |
+| 本 README                  | 项目概述、结构、依赖、使用方式与能力表                                                       |
+| eth/doc.go                 | 对外包 eth 的包文档与使用示例                                                                |
+| internal/config            | EVM WalletConfig、BuildConfigFromConfiger（依赖 github.com/godaddy-x/wallet-adapter/config） |
+| internal/manager           | WalletManager、LoadAssetsConfig、RPC/余额/广播                                               |
+| internal/decoder           | AddressDecoder、TransactionDecoder、SmartContractDecoder（EVM/ERC20/ERC20 代币余额与元数据） |
+| internal/rpc、models、util | JSON-RPC 客户端、内部模型、精度与地址工具                                                    |
 
 ## License
 
