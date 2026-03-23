@@ -12,6 +12,7 @@ import (
 
 	"github.com/godaddy-x/wallet-adapter-eth/eth"
 	ethscanner "github.com/godaddy-x/wallet-adapter-eth/internal/scanner"
+	adaptscanner "github.com/godaddy-x/wallet-adapter/scanner"
 	"github.com/godaddy-x/wallet-adapter/types"
 	"github.com/tidwall/gjson"
 )
@@ -462,32 +463,35 @@ func TestRunScanLoopContinuously(t *testing.T) {
 		t.Skipf("latest block height too small: %d", latest)
 	}
 
-	// confirmations 用于确定安全高度 safeTo=latest-confirmations。
-	// 本次观察将确认数设为 6，并使 windowSize=6，保证在追平 latest 后会持续循环覆盖最近 6 个安全块。
+	// confirmations 仅用于计算 BlockHeader.Confirmations 字段供业务层参考
 	var confirmations uint64 = 6
-	var windowSize uint64 = 0
 	startHeight := testHeight
 
 	go func() {
-		if err := rawScanner.RunScanLoop(uint64(startHeight), confirmations, windowSize, 5*time.Second, func(res *types.BlockScanResult) {
-			if res == nil {
-				fmt.Printf("[RunScanLoop] nil result\n")
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-			if res.Once {
-				fmt.Printf("[RunScanLoop] once -------------- %d - %d\n", res.Height, res.NetworkBlockHeight)
-			}
-			latestMax := rawScanner.GetGlobalMaxBlockHeight()
-			headerHash := ""
-			prevHash := ""
-			if res.Header != nil {
-				headerHash = res.Header.Hash
-				prevHash = res.Header.Previousblockhash
-			}
-			fmt.Printf("[RunScanLoop] scanHeight=%d latestMax=%d hash=%s header=%s prev=%s success=%v err=%q txTotal=%d txFailed=%d extracted=%d once=%v\n",
-				res.Height, latestMax, res.BlockHash, headerHash, prevHash, res.Success, res.ErrorReason,
-				res.TxTotal, res.TxFailed, res.ExtractedTxs, res.Once)
+		if err := rawScanner.RunScanLoop(adaptscanner.ScanLoopParams{
+			StartHeight:   uint64(startHeight),
+			Confirmations: confirmations,
+			Interval:      5 * time.Second,
+			HandleBlock: func(res *types.BlockScanResult) {
+				if res == nil {
+					fmt.Printf("[RunScanLoop] nil result\n")
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+				if res.Once {
+					fmt.Printf("[RunScanLoop] once -------------- %d - %d\n", res.Height, res.NetworkBlockHeight)
+				}
+				latestMax := rawScanner.GetGlobalMaxBlockHeight()
+				headerHash := ""
+				prevHash := ""
+				if res.Header != nil {
+					headerHash = res.Header.Hash
+					prevHash = res.Header.Previousblockhash
+				}
+				fmt.Printf("[RunScanLoop] scanHeight=%d latestMax=%d hash=%s header=%s prev=%s success=%v err=%q txTotal=%d txFailed=%d extracted=%d once=%v\n",
+					res.Height, latestMax, res.BlockHash, headerHash, prevHash, res.Success, res.ErrorReason,
+					res.TxTotal, res.TxFailed, res.ExtractedTxs, res.Once)
+			},
 		}); err != nil {
 			fmt.Printf("[RunScanLoop] error: %v\n", err)
 		}
@@ -509,7 +513,7 @@ func TestRunScanLoopContinuously(t *testing.T) {
 	}
 	t.Logf("ScanBlockPrioritize called with heights: %v", prioritizeHeights)
 
-	t.Logf("RunScanLoop started: latest=%d startHeight=%d confirmations=%d windowSize=%d, running ~10 minutes...",
-		latest, startHeight, confirmations, windowSize)
+	t.Logf("RunScanLoop started: latest=%d startHeight=%d confirmations=%d running ~10 minutes...",
+		latest, startHeight, confirmations)
 	time.Sleep(10 * time.Minute)
 }

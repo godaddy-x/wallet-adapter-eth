@@ -30,8 +30,8 @@ package scanner
 //      （主币比对 from/to/value，代币基于 txid+contractAddr+outputIndex 精确定位单条 Transfer）
 //
 // 4. 持续扫描循环（Cursor-level）：
-//    - RunScanLoop：从指定起始高度 startHeight 开始（inclusive），持续扫描至 safeTo=latest-confirmations，
-//      可选 windowSize 用于回填最近若干安全块以覆盖重组；每扫完一个高度将 BlockScanResult 同步回调给外部。
+//    - RunScanLoop：从指定起始高度 StartHeight 开始（inclusive），持续扫描至 safeTo=latest-Confirmations，
+//      仅处理满足确认数的安全区块；每扫完一个高度将 BlockScanResult 同步回调给外部。
 //
 // 5. 性能与缓存：
 //    - TxExtractConcurrency：控制单区块内按 txhash 并行提取的 goroutine 数量
@@ -82,7 +82,7 @@ type EthBlockScanner struct {
 	wm *manager.WalletManager
 
 	// scannedHeight 为 Run() 周期任务使用的内存游标（不做持久化）。
-	// 设计目标：仅用于“自动追块”场景；更推荐外部系统使用 RunScanLoop 自行维护游标与回填窗口。
+	// 设计目标：仅用于“自动追块”场景；更推荐外部系统使用 RunScanLoop 自行维护游标。
 	scannedHeight   uint64
 	scannedHeightMu sync.RWMutex
 
@@ -667,8 +667,8 @@ func NewBlockScanner(wm *manager.WalletManager) *EthBlockScanner {
 	}
 	bs.scanLoopCond = sync.NewCond(&bs.scanLoopMu)
 	bs.scanLoopPauseCh = make(chan struct{})
-	// Run() 周期任务：自动追块（不含 confirmations/window），适用于简单场景；
-	// 更推荐外部系统使用 RunScanLoop 维护游标与回填窗口。
+	// Run() 周期任务：自动追块（不含 Confirmations），适用于简单场景；
+	// 更推荐外部系统使用 RunScanLoop 维护游标。
 	bs.SetTask(bs.scanBlockTask)
 	// 初始化游标为当前最新高度，避免首次 Run() 从 0 开始全量扫历史
 	if wm != nil && wm.Client != nil {
@@ -824,38 +824,32 @@ func (bs *EthBlockScanner) getTokenDecimals(contractAddr string) (int32, bool) {
 	return decimals, true
 }
 
-// RunScanLoop 从外部指定的 startHeight 开始（inclusive），持续按高度向上扫描，并始终只扫描已满足 confirmations 的安全范围。
-//   - 设定 safeTo = latest - confirmations（latest 为链上最新高度）
-//   - 扫描高度在每轮循环中包含一个回填窗口：从 windowFrom = max(0, safeTo-windowSize) 扫到 safeTo
-//     为了捕获潜在重组，这个回填窗口在每轮都会重新扫描（即使已扫过）。
-//   - 每扫完一个区块高度就同步调用 handleBlock（若 handleBlock 为 nil 则忽略）。
-func (bs *EthBlockScanner) RunScanLoop(
-	startHeight, confirmations, windowSize uint64,
-	interval time.Duration,
-	handleBlock func(res *types.BlockScanResult),
-) error {
+// RunScanLoop 从外部指定的 StartHeight 开始（inclusive），持续按高度向上扫描，并始终只扫描已满足 Confirmations 的安全范围。
+//   - 设定 safeTo = latest - Confirmations（latest 为链上最新高度）
+//   - 每扫完一个区块高度就同步调用 HandleBlock（若 HandleBlock 为 nil 则忽略）。
+func (bs *EthBlockScanner) RunScanLoop(params adaptscanner.ScanLoopParams) error {
 	if bs.wm == nil || bs.wm.Client == nil {
 		return fmt.Errorf("wallet manager or rpc client is nil")
 	}
 	if bs.wm.Config == nil {
 		return fmt.Errorf("wallet manager config is nil")
 	}
-	if interval <= 0 {
-		interval = 5 * time.Second
+	if params.Interval <= 0 {
+		params.Interval = 5 * time.Second
 	}
 
 	// 保存 RunScanLoop 配置，供插队扫描复用
-	bs.scanLoopConfirmations = confirmations
-	bs.scanLoopHandleFunc = handleBlock
+	bs.scanLoopConfirmations = params.Confirmations
+	bs.scanLoopHandleFunc = params.HandleBlock
 
-	// cursor 表示“已处理到的安全高度”（safeTo）。
-	// 为了让第一次扫描命中 startHeight，我们把 cursor 初始化到 startHeight-1。
-	// 当 startHeight==0 时，cursor 保持为 0，第一次扫描从 0 开始（inclusive）。
+	// cursor 表示"已处理到的安全高度"（safeTo）。
+	// 为了让第一次扫描命中 StartHeight，我们把 cursor 初始化到 StartHeight-1。
+	// 当 StartHeight==0 时，cursor 保持为 0，第一次扫描从 0 开始（inclusive）。
 	var cursor uint64
-	if startHeight == 0 {
+	if params.StartHeight == 0 {
 		cursor = 0
 	} else {
-		cursor = startHeight - 1
+		cursor = params.StartHeight - 1
 	}
 
 	for {
@@ -873,8 +867,8 @@ func (bs *EthBlockScanner) RunScanLoop(
 				errMsg = "cannot get latest block height (returned 0)"
 			}
 			// 通过回调通知业务层 RPC 连接异常
-			if handleBlock != nil {
-				handleBlock(&types.BlockScanResult{
+			if params.HandleBlock != nil {
+				params.HandleBlock(&types.BlockScanResult{
 					Symbol:           bs.wm.Config.Symbol,
 					Success:          false,
 					ErrorReason:      errMsg,
@@ -885,7 +879,7 @@ func (bs *EthBlockScanner) RunScanLoop(
 			}
 			// 等待 interval，但允许 Pause 立即打断并进入阻塞
 			select {
-			case <-time.After(interval):
+			case <-time.After(params.Interval):
 			case <-bs.getPauseCh():
 			}
 			continue
@@ -893,44 +887,31 @@ func (bs *EthBlockScanner) RunScanLoop(
 
 		// confirmations 足够时，safeTo 才有意义
 		var safeTo uint64
-		if latest > confirmations {
-			safeTo = latest - confirmations
+		if latest > params.Confirmations {
+			safeTo = latest - params.Confirmations
 		} else {
 			safeTo = 0
 		}
-		// 为了持续覆盖潜在重组，需要当 safeTo 不变时也继续对回填窗口进行重扫，
-		// 因此这里仅在 safeTo=0 时跳过。
+		// safeTo=0 时跳过，等待链增长
 		if safeTo == 0 {
 			select {
-			case <-time.After(interval):
+			case <-time.After(params.Interval):
 			case <-bs.getPauseCh():
 			}
 			continue
 		}
 
-		// 计算回填窗口起点；窗口范围每轮都会重新扫以捕获潜在重组。
-		windowFrom := uint64(0)
-		if windowSize > 0 {
-			if safeTo > windowSize {
-				windowFrom = safeTo - windowSize
-			} else {
-				windowFrom = 0
-			}
-		}
-
-		// 默认从 cursor+1 开始扫；若 windowFrom 落在 cursor 之后（或更靠近链头），则扩展为从 windowFrom 开始回填。
+		// 扫描区间 [cursor+1..safeTo]：
+		// - 扫描失败不退出 loop；
+		// - 当某高度失败时，停留在该高度持续重试（不推进 cursor），并将失败结果回调给业务侧；
+		// - 业务侧可根据 res.ErrorReason 决定告警、跳过高度或调整策略。
 		scanFrom := cursor + 1
-		// 仅当 windowSize>0 才允许回填已扫描过的高度。
-		// windowSize=0 时 scanFrom 始终等于 cursor+1，保证不会重复扫历史安全高度。
-		if windowSize > 0 && windowFrom < scanFrom {
-			scanFrom = windowFrom
-		}
 
 		// 优化：如果 scanFrom > safeTo，说明没有新高度需要扫描（已追平最新安全高度）
 		// 此时直接跳过内层扫描，仅等待 interval 后再次检查
 		if scanFrom > safeTo {
 			select {
-			case <-time.After(interval):
+			case <-time.After(params.Interval):
 			case <-bs.getPauseCh():
 			}
 			continue
@@ -1028,8 +1009,8 @@ func (bs *EthBlockScanner) RunScanLoop(
 					}
 				}
 
-				if handleBlock != nil {
-					handleBlock(res)
+				if params.HandleBlock != nil {
+					params.HandleBlock(res)
 				}
 
 				// 将 cursor 更新到 h-1：下一轮从 h 开始重试，避免重复扫更早高度。
@@ -1041,28 +1022,28 @@ func (bs *EthBlockScanner) RunScanLoop(
 
 				// 停留在该高度重试
 				select {
-				case <-time.After(interval):
+				case <-time.After(params.Interval):
 				case <-bs.getPauseCh():
 				}
 				break
 			}
 
-			if handleBlock != nil {
+			if params.HandleBlock != nil {
 				// network height（本轮 latest）用于业务侧观测进度与告警
 				if res != nil {
 					res.NetworkBlockHeight = latest
 				}
-				handleBlock(res)
+				params.HandleBlock(res)
 			}
 		}
 
-		// 将游标推进到当前轮的 safeTo；后续重组由回填窗口再次扫描覆盖。
+		// 将游标推进到当前轮的 safeTo。
 		// 只有当本轮完整扫过至 safeTo 时才推进；若中途失败 break，则停留在失败高度重试。
 		if completed {
 			cursor = safeTo
 		}
 		select {
-		case <-time.After(interval):
+		case <-time.After(params.Interval):
 		case <-bs.getPauseCh():
 		}
 	}
