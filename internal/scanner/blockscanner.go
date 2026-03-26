@@ -1,4 +1,4 @@
-﻿package scanner
+package scanner
 
 // EthBlockScanner: 以太坊/EVM 区块扫描器
 //
@@ -63,12 +63,14 @@ type EthBlockScanner struct {
 	TxExtractConcurrency int
 
 	// tokenDecimalsCache 合约精度缓存（>0=有效, 0=查询失败/非标准，调用方需跳过）
-	tokenDecimalsCache   map[string]int32
-	tokenDecimalsCacheMu sync.RWMutex
+	tokenDecimalsCache      map[string]int32
+	tokenDecimalsCacheMu    sync.RWMutex
+	tokenDecimalsCacheMax   int      // 缓存上限，避免内存无限增长
+	tokenDecimalsCacheOrder []string // FIFO 淘汰顺序
 
 	// blockTimestampCache 区块时间戳缓存（FIFO 淘汰策略）
-	blockTimestampCache   map[string]int64
-	blockTimestampCacheMu sync.RWMutex
+	blockTimestampCache      map[string]int64
+	blockTimestampCacheMu    sync.RWMutex
 	blockTimestampCacheMax   int
 	blockTimestampCacheOrder []string
 
@@ -226,7 +228,7 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 					if item == nil {
 						continue
 					}
-				// 查找相同 SourceKey 的 item
+					// 查找相同 SourceKey 的 item
 					found := false
 					for _, existing := range res.ExtractData {
 						if existing.SourceKey == item.SourceKey {
@@ -333,12 +335,18 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 	if gasUsedHex := rcRes.Get("gasUsed").String(); gasUsedHex != "" {
 		if gasUsed, err := hexutil.DecodeBig(gasUsedHex); err == nil {
 			var gasPrice *big.Int
+			// EIP-1559: 优先使用 receipt.effectiveGasPrice
 			if gp := rcRes.Get("effectiveGasPrice").String(); gp != "" {
-				gasPrice, _ = hexutil.DecodeBig(gp)
+				if decoded, err := hexutil.DecodeBig(gp); err == nil {
+					gasPrice = decoded
+				}
 			}
+			// 非 EIP-1559 交易或获取失败时，回退到 tx.gasPrice
 			if gasPrice == nil {
 				if gp := txNode.Get("gasPrice").String(); gp != "" {
-					gasPrice, _ = hexutil.DecodeBig(gp)
+					if decoded, err := hexutil.DecodeBig(gp); err == nil {
+						gasPrice = decoded
+					}
 				}
 			}
 			if gasPrice != nil {
@@ -354,12 +362,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 // TokenMetadataFunc 现由外部在 Base 上统一注入（与 ScanTargetFunc 一致），此处仅依赖其存在而不再单独持有。
 func NewBlockScanner(wm *manager.WalletManager) *EthBlockScanner {
 	bs := &EthBlockScanner{
-		Base:                   adaptscanner.NewBlockScannerBase(),
-		wm:                     wm,
-		TxExtractConcurrency:   10,
-		tokenDecimalsCache:     make(map[string]int32),
-		blockTimestampCache:    make(map[string]int64),
-		blockTimestampCacheMax: 1024,
+		Base:                    adaptscanner.NewBlockScannerBase(),
+		wm:                      wm,
+		TxExtractConcurrency:    10,
+		tokenDecimalsCache:      make(map[string]int32),
+		tokenDecimalsCacheMax:   1024,
+		tokenDecimalsCacheOrder: make([]string, 0, 1024),
+		blockTimestampCache:     make(map[string]int64),
+		blockTimestampCacheMax:  1024,
 	}
 	bs.scanLoopCond = sync.NewCond(&bs.scanLoopMu)
 	bs.scanLoopPauseCh = make(chan struct{})
@@ -468,51 +478,78 @@ func (bs *EthBlockScanner) getTokenDecimals(contractAddr string) (int32, bool) {
 	if contractAddr == "" || bs.wm == nil {
 		return 0, false
 	}
+
+	// 验证合约地址格式
+	if !isValidAddress(contractAddr) {
+		return 0, false
+	}
+
 	bs.tokenDecimalsCacheMu.RLock()
 	d, ok := bs.tokenDecimalsCache[contractAddr]
 	bs.tokenDecimalsCacheMu.RUnlock()
 	if ok {
-		// 仅当缓存中为有效精度时使用；0 视为“已知失败”，直接让调用方跳过
 		if d > 0 {
 			return d, true
 		}
 		return 0, false
 	}
 
-	// 1）优先调用 Base 上由上层业务注入的 TokenMetadataFunc，允许业务系统按自身资产配置提供精度信息。
-	// 约定：返回的 SmartContract 非空且 Decimals>0 表示业务侧已配置该合约的有效精度。
+	// 1) 优先使用 TokenMetadataFunc
 	if bs.TokenMetadataFunc != nil && bs.wm.Config != nil {
 		if sc := bs.TokenMetadataFunc(bs.wm.Config.Symbol, contractAddr); sc != nil && sc.Decimals > 0 {
 			decimals := int32(sc.Decimals)
-			bs.tokenDecimalsCacheMu.Lock()
-			if _, exists := bs.tokenDecimalsCache[contractAddr]; !exists {
-				bs.tokenDecimalsCache[contractAddr] = decimals
-			}
-			bs.tokenDecimalsCacheMu.Unlock()
+			bs.setTokenDecimalsCache(contractAddr, decimals)
 			return decimals, true
 		}
 	}
 
-	// 2) 业务侧未配置则查询链上 ERC20 metadata
+	// 2) 查询链上 ERC20 metadata
 	_, _, dec, err := bs.wm.ERC20Metadata(contractAddr)
 	if err != nil || dec == 0 {
-		// 记录错误日志并缓存无效标记，避免重复查询
 		fmt.Printf("[EthBlockScanner] getTokenDecimals failed for contract %s: %v, decimals=%d\n", contractAddr, err, dec)
-		bs.tokenDecimalsCacheMu.Lock()
-		if _, exists := bs.tokenDecimalsCache[contractAddr]; !exists {
-			bs.tokenDecimalsCache[contractAddr] = 0
-		}
-		bs.tokenDecimalsCacheMu.Unlock()
+		bs.setTokenDecimalsCache(contractAddr, 0)
 		return 0, false
 	}
 
 	decimals := int32(dec)
-	bs.tokenDecimalsCacheMu.Lock()
-	if _, exists := bs.tokenDecimalsCache[contractAddr]; !exists {
-		bs.tokenDecimalsCache[contractAddr] = decimals
-	}
-	bs.tokenDecimalsCacheMu.Unlock()
+	bs.setTokenDecimalsCache(contractAddr, decimals)
 	return decimals, true
+}
+
+// setTokenDecimalsCache 带 FIFO 淘汰策略的缓存写入
+func (bs *EthBlockScanner) setTokenDecimalsCache(contractAddr string, decimals int32) {
+	bs.tokenDecimalsCacheMu.Lock()
+	defer bs.tokenDecimalsCacheMu.Unlock()
+
+	if _, exists := bs.tokenDecimalsCache[contractAddr]; exists {
+		bs.tokenDecimalsCache[contractAddr] = decimals
+		return
+	}
+
+	// FIFO 淘汰
+	if bs.tokenDecimalsCacheMax > 0 && len(bs.tokenDecimalsCache) >= bs.tokenDecimalsCacheMax {
+		if len(bs.tokenDecimalsCacheOrder) > 0 {
+			oldest := bs.tokenDecimalsCacheOrder[0]
+			delete(bs.tokenDecimalsCache, oldest)
+			bs.tokenDecimalsCacheOrder = bs.tokenDecimalsCacheOrder[1:]
+		}
+	}
+
+	bs.tokenDecimalsCache[contractAddr] = decimals
+	bs.tokenDecimalsCacheOrder = append(bs.tokenDecimalsCacheOrder, contractAddr)
+}
+
+// isValidAddress 验证以太坊地址格式
+func isValidAddress(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	s := strings.TrimPrefix(strings.ToLower(addr), "0x")
+	if len(s) != 40 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // RunScanLoop 从外部指定的 StartHeight 开始（inclusive），持续按高度向上扫描，并始终只扫描已满足 Confirmations 的安全范围。
@@ -875,7 +912,7 @@ func (bs *EthBlockScanner) processPriorityScan() int {
 		} else {
 			errMsg = "cannot get latest block height (returned 0)"
 		}
-			// RPC 异常时回调通知
+		// RPC 异常时回调通知
 		if handleFunc != nil {
 			handleFunc(&types.BlockScanResult{
 				Symbol:           bs.wm.Config.Symbol,
@@ -1195,13 +1232,18 @@ func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTar
 	if gasUsedHex := rcRes.Get("gasUsed").String(); gasUsedHex != "" {
 		if gasUsed, err := hexutil.DecodeBig(gasUsedHex); err == nil {
 			var gasPrice *big.Int
-			// effectiveGasPrice is in receipt, not transaction (EIP-1559)
+			// EIP-1559: 优先使用 receipt.effectiveGasPrice
 			if gp := rcRes.Get("effectiveGasPrice").String(); gp != "" {
-				gasPrice, _ = hexutil.DecodeBig(gp)
+				if decoded, err := hexutil.DecodeBig(gp); err == nil {
+					gasPrice = decoded
+				}
 			}
+			// 非 EIP-1559 交易或获取失败时，回退到 tx.gasPrice
 			if gasPrice == nil {
 				if gp := txRes.Get("gasPrice").String(); gp != "" {
-					gasPrice, _ = hexutil.DecodeBig(gp)
+					if decoded, err := hexutil.DecodeBig(gp); err == nil {
+						gasPrice = decoded
+					}
 				}
 			}
 			if gasPrice != nil {
@@ -1337,6 +1379,11 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			// 获取创建的合约地址（从回执中）
 			if rcRes != nil {
 				createdAddr = rcRes.Get("contractAddress").String()
+			}
+			// 验证合约地址格式
+			if createdAddr != "" && !isValidAddress(createdAddr) {
+				fmt.Printf("[EthBlockScanner] invalid contract address created: %s\n", createdAddr)
+				createdAddr = ""
 			}
 			ext = map[string]string{
 				"contract_creation": "true",
@@ -1510,9 +1557,11 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			},
 		}
 
-		fromParam := types.NewScanTargetParamForAddress(contractAddr, fromToken)
+		// 使用 NewScanTargetParamForContract 让业务层能识别这是合约地址（ScanTargetTypeContractAddress）
+		// 业务层可在 ScanTargetFunc 中通过 target.ScanTargetType 区分主币/合约，实现合约白名单过滤
+		fromParam := types.NewScanTargetParamForContract(contractAddr, fromToken)
 		fromRes := scanTargetFunc(fromParam)
-		toParam := types.NewScanTargetParamForAddress(contractAddr, toToken)
+		toParam := types.NewScanTargetParamForContract(contractAddr, toToken)
 		toRes := scanTargetFunc(toParam)
 
 		// 判断是否为内部转账（双方属于同一账户）
