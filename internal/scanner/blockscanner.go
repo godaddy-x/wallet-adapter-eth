@@ -16,6 +16,7 @@ package scanner
 //   - 缓存优化：tokenDecimalsCache、blockTimestampCache 减少重复 RPC
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -31,16 +32,6 @@ import (
 	"github.com/godaddy-x/wallet-adapter/types"
 	"github.com/tidwall/gjson"
 )
-
-// splitAddrAmount 从 "address:amount" 格式中分离地址和金额。
-// 用于 decoder 层转换旧格式，扫块器内部直接使用分离字段无需调用此函数。
-func splitAddrAmount(s string) (addr string, amount string) {
-	parts := strings.SplitN(s, ":", 2)
-	if len(parts) == 2 {
-		return strings.ToLower(parts[0]), parts[1]
-	}
-	return strings.ToLower(s), ""
-}
 
 // EthBlockScanner 以太坊区块扫描器，实现 BlockScanner 接口。
 // 嵌入 Base 复用任务调度，通过 WalletManager 进行 RPC 查询与交易提取。
@@ -184,22 +175,52 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 
 		var wg sync.WaitGroup
 		wg.Add(workers)
-		for i := 0; i < workers; i++ {
-			go func() {
-				defer wg.Done()
-				for txNode := range jobs {
-					txHash := txNode.Get("hash").String()
-					ed, cr, matched, e := bs.extractTransactionAndReceiptDataFromBlockTx(txNode, hash, blockHeight, confirmTime, bs.ScanTargetFunc)
-					outs <- txExtractOut{
-						txHash:           txHash,
-						extractData:      ed,
-						contractReceipts: cr,
-						err:              e,
-						matched:          matched,
-					}
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for txNode := range jobs {
+				txHash := txNode.Get("hash").String()
+
+				// 使用超时上下文防止单个交易处理阻塞太久
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				type result struct {
+					ed      []*types.ExtractDataItem
+					cr      []*types.ContractReceiptItem
+					matched bool
+					err     error
 				}
-			}()
-		}
+				resChan := make(chan result, 1)
+
+				go func(node gjson.Result) {
+					defer func() {
+						if r := recover(); r != nil {
+							resChan <- result{err: fmt.Errorf("panic: %v", r)}
+						}
+					}()
+					ed, cr, matched, e := bs.extractTransactionAndReceiptDataFromBlockTx(node, hash, blockHeight, confirmTime, bs.ScanTargetFunc)
+					resChan <- result{ed: ed, cr: cr, matched: matched, err: e}
+				}(txNode)
+
+				var outResult result
+				select {
+				case outResult = <-resChan:
+					// 正常完成
+				case <-ctx.Done():
+					// 超时
+					outResult = result{err: fmt.Errorf("extract transaction timeout: %s", txHash)}
+				}
+				cancel()
+
+				outs <- txExtractOut{
+					txHash:           txHash,
+					extractData:      outResult.ed,
+					contractReceipts: outResult.cr,
+					err:              outResult.err,
+					matched:          outResult.matched,
+				}
+			}
+		}()
+	}
 
 		go func() {
 			for _, txNode := range txNodes {
@@ -306,7 +327,11 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 	// 失败交易直接跳过
 	status := types.TxStatusFail
 	if statusHex := rcRes.Get("status").String(); statusHex != "" {
-		if st, err := hexutil.DecodeUint64(statusHex); err == nil && st == 1 {
+		st, err := hexutil.DecodeUint64(statusHex)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("decode status hex failed: %s, err: %v", statusHex, err)
+		}
+		if st == 1 {
 			status = types.TxStatusSuccess
 		}
 	}
@@ -324,27 +349,38 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 
 	amount := big.NewInt(0)
 	if valueHex != "" && valueHex != "0x" {
-		if v, err := hexutil.DecodeBig(valueHex); err == nil {
-			amount = v
+		v, err := hexutil.DecodeBig(valueHex)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("decode value hex failed: %s, err: %v", valueHex, err)
 		}
+		amount = v
 	}
 	amountStr := util.BigIntToDecimal(amount, bs.wm.SymbolDecimal())
 
 	// fee = gasUsed * effectiveGasPrice
 	var fee *big.Int = big.NewInt(0)
 	if gasUsedHex := rcRes.Get("gasUsed").String(); gasUsedHex != "" {
-		if gasUsed, err := hexutil.DecodeBig(gasUsedHex); err == nil {
+		gasUsed, err := hexutil.DecodeBig(gasUsedHex)
+		if err != nil {
+			fmt.Printf("[EthBlockScanner] decode gasUsed failed for tx %s: %s, err: %v\n", txid, gasUsedHex, err)
+		} else {
 			var gasPrice *big.Int
 			// EIP-1559: 优先使用 receipt.effectiveGasPrice
 			if gp := rcRes.Get("effectiveGasPrice").String(); gp != "" {
-				if decoded, err := hexutil.DecodeBig(gp); err == nil {
+				decoded, err := hexutil.DecodeBig(gp)
+				if err != nil {
+					fmt.Printf("[EthBlockScanner] decode effectiveGasPrice failed for tx %s: %s, err: %v\n", txid, gp, err)
+				} else {
 					gasPrice = decoded
 				}
 			}
 			// 非 EIP-1559 交易或获取失败时，回退到 tx.gasPrice
 			if gasPrice == nil {
 				if gp := txNode.Get("gasPrice").String(); gp != "" {
-					if decoded, err := hexutil.DecodeBig(gp); err == nil {
+					decoded, err := hexutil.DecodeBig(gp)
+					if err != nil {
+						fmt.Printf("[EthBlockScanner] decode gasPrice failed for tx %s: %s, err: %v\n", txid, gp, err)
+					} else {
 						gasPrice = decoded
 					}
 				}
@@ -523,6 +559,15 @@ func (bs *EthBlockScanner) setTokenDecimalsCache(contractAddr string, decimals i
 
 	if _, exists := bs.tokenDecimalsCache[contractAddr]; exists {
 		bs.tokenDecimalsCache[contractAddr] = decimals
+		// 更新访问顺序：移到队尾表示最近访问
+		for i, addr := range bs.tokenDecimalsCacheOrder {
+			if addr == contractAddr {
+				// 移除当前位置
+				bs.tokenDecimalsCacheOrder = append(bs.tokenDecimalsCacheOrder[:i], bs.tokenDecimalsCacheOrder[i+1:]...)
+				break
+			}
+		}
+		bs.tokenDecimalsCacheOrder = append(bs.tokenDecimalsCacheOrder, contractAddr)
 		return
 	}
 
@@ -549,7 +594,15 @@ func isValidAddress(addr string) bool {
 		return false
 	}
 	_, err := hex.DecodeString(s)
-	return err == nil
+	if err != nil {
+		return false
+	}
+	// 检查零地址（燃烧地址）
+	zeroAddr := "0000000000000000000000000000000000000000"
+	if s == zeroAddr {
+		return false
+	}
+	return true
 }
 
 // RunScanLoop 从外部指定的 StartHeight 开始（inclusive），持续按高度向上扫描，并始终只扫描已满足 Confirmations 的安全范围。
@@ -1106,14 +1159,17 @@ func (bs *EthBlockScanner) getBlockTimestamp(blockHash string, fallback int64) i
 	// eth_getBlockByHash 不返回 full tx 列表，降低 payload。
 	blkRes, err := bs.wm.Client.Call("eth_getBlockByHash", []interface{}{blockHash, false})
 	if err != nil {
+		fmt.Printf("[EthBlockScanner] getBlockTimestamp RPC failed for %s: %v, using fallback %d\n", blockHash, err, fallback)
 		return fallback
 	}
 	tsHex := blkRes.Get("timestamp").String()
 	if tsHex == "" || tsHex == "0x" {
+		fmt.Printf("[EthBlockScanner] getBlockTimestamp empty timestamp for %s, using fallback %d\n", blockHash, fallback)
 		return fallback
 	}
 	tsUint, err := hexutil.DecodeUint64(tsHex)
 	if err != nil || tsUint == 0 {
+		fmt.Printf("[EthBlockScanner] getBlockTimestamp decode failed for %s: hex=%s err=%v, using fallback %d\n", blockHash, tsHex, err, fallback)
 		return fallback
 	}
 	ts := int64(tsUint)
@@ -1142,7 +1198,7 @@ func (bs *EthBlockScanner) getBlockTimestamp(blockHash string, fallback int64) i
 
 // extractAddressFromTopic 从 32 字节 topic 十六进制串中提取地址（后 20 字节）。
 // 兼容带 0x/0X 前缀（66 字符）与无前缀（64 字符），去前缀后必须恰好 64 字符否则返回空（白名单校验）。
-// 不做 hex 解码校验：合规节点返回的 topic 均为合法十六进制，安全边界在节点层；但增加防御性长度检查防止panic。
+// 增加防御性长度检查防止 panic，同时检查零地址。
 func extractAddressFromTopic(topic string) string {
 	s := strings.TrimSpace(topic)
 	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
@@ -1154,6 +1210,11 @@ func extractAddressFromTopic(topic string) string {
 	addrPart := s[24:] // 后 40 hex = 20 字节地址
 	if len(addrPart) != 40 {
 		return "" // 防御性检查：确保地址部分长度正确
+	}
+	// 检查零地址（燃烧地址）
+	zeroAddr := "0000000000000000000000000000000000000000"
+	if addrPart == zeroAddr {
+		return ""
 	}
 	return "0x" + strings.ToLower(addrPart)
 }
@@ -1213,42 +1274,52 @@ func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTar
 
 	var blockHeight uint64
 	if blockNumberHex != "" {
-		if h, err := hexutil.DecodeUint64(blockNumberHex); err == nil {
-			blockHeight = h
+		h, err := hexutil.DecodeUint64(blockNumberHex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode blockNumber hex failed: %s, err: %v", blockNumberHex, err)
 		}
+		blockHeight = h
 	}
 
 	// value 解析为主币金额
 	amount := big.NewInt(0)
 	if valueHex != "" && valueHex != "0x" {
-		if v, err := hexutil.DecodeBig(valueHex); err == nil {
-			amount = v
+		v, err := hexutil.DecodeBig(valueHex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode value hex failed: %s, err: %v", valueHex, err)
 		}
+		amount = v
 	}
 	amountStr := util.BigIntToDecimal(amount, bs.wm.SymbolDecimal())
 
 	// 手续费 = gasUsed * effectiveGasPrice (fall back 到 gasPrice)
 	var fee *big.Int = big.NewInt(0)
 	if gasUsedHex := rcRes.Get("gasUsed").String(); gasUsedHex != "" {
-		if gasUsed, err := hexutil.DecodeBig(gasUsedHex); err == nil {
-			var gasPrice *big.Int
-			// EIP-1559: 优先使用 receipt.effectiveGasPrice
-			if gp := rcRes.Get("effectiveGasPrice").String(); gp != "" {
-				if decoded, err := hexutil.DecodeBig(gp); err == nil {
-					gasPrice = decoded
+		gasUsed, err := hexutil.DecodeBig(gasUsedHex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode gasUsed hex failed: %s, err: %v", gasUsedHex, err)
+		}
+		var gasPrice *big.Int
+		// EIP-1559: 优先使用 receipt.effectiveGasPrice
+		if gp := rcRes.Get("effectiveGasPrice").String(); gp != "" {
+			decoded, err := hexutil.DecodeBig(gp)
+			if err != nil {
+				return nil, nil, fmt.Errorf("decode effectiveGasPrice hex failed: %s, err: %v", gp, err)
+			}
+			gasPrice = decoded
+		}
+		// 非 EIP-1559 交易或获取失败时，回退到 tx.gasPrice
+		if gasPrice == nil {
+			if gp := txRes.Get("gasPrice").String(); gp != "" {
+				decoded, err := hexutil.DecodeBig(gp)
+				if err != nil {
+					return nil, nil, fmt.Errorf("decode gasPrice hex failed: %s, err: %v", gp, err)
 				}
+				gasPrice = decoded
 			}
-			// 非 EIP-1559 交易或获取失败时，回退到 tx.gasPrice
-			if gasPrice == nil {
-				if gp := txRes.Get("gasPrice").String(); gp != "" {
-					if decoded, err := hexutil.DecodeBig(gp); err == nil {
-						gasPrice = decoded
-					}
-				}
-			}
-			if gasPrice != nil {
-				fee = new(big.Int).Mul(gasUsed, gasPrice)
-			}
+		}
+		if gasPrice != nil {
+			fee = new(big.Int).Mul(gasUsed, gasPrice)
 		}
 	}
 	feeStr := util.BigIntToDecimal(fee, bs.wm.SymbolDecimal())
@@ -1256,7 +1327,11 @@ func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTar
 	// 默认视为失败，仅当回执 status 明确为 0x1 时视为成功（EIP-658）
 	status := types.TxStatusFail
 	if statusHex := rcRes.Get("status").String(); statusHex != "" {
-		if st, err := hexutil.DecodeUint64(statusHex); err == nil && st == 1 {
+		st, err := hexutil.DecodeUint64(statusHex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode status hex failed: %s, err: %v", statusHex, err)
+		}
+		if st == 1 {
 			status = types.TxStatusSuccess
 		}
 	}
@@ -1511,7 +1586,12 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			if fromToken != "" && toToken != "" {
 				if dataHex != "" && dataHex != "0x" {
 					// 安全校验：严格检查 data 长度必须为 32 字节，防止恶意合约攻击
-					if b, err := hexutil.Decode(dataHex); err == nil && len(b) == 32 {
+					b, err := hexutil.Decode(dataHex)
+					if err != nil {
+						fmt.Printf("[EthBlockScanner] skip ERC20 Transfer: decode data hex failed for %s: %v\n", dataHex, err)
+						continue
+					}
+					if len(b) == 32 {
 						tokenAmount = new(big.Int).SetBytes(b)
 					}
 				}
@@ -1523,7 +1603,12 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			if dataHex != "" && dataHex != "0x" {
 				// 非标准格式：data 应包含 32 字节 to 地址 + 32 字节 amount = 64 字节
-				if b, err := hexutil.Decode(dataHex); err == nil && len(b) == 64 {
+				b, err := hexutil.Decode(dataHex)
+				if err != nil {
+					fmt.Printf("[EthBlockScanner] skip ERC20 Transfer: decode data hex failed for %s: %v\n", dataHex, err)
+					continue
+				}
+				if len(b) == 64 {
 					addrBytes := b[12:32]
 					if len(addrBytes) == 20 {
 						toToken = "0x" + strings.ToLower(hex.EncodeToString(addrBytes))
@@ -1649,20 +1734,6 @@ func validateAddrAmtMatch(tx *types.Transaction) error {
 	}
 	if len(tx.ToAddr) != len(tx.ToAmt) {
 		return fmt.Errorf("ToAddr/ToAmt length mismatch: %d vs %d", len(tx.ToAddr), len(tx.ToAmt))
-	}
-	return nil
-}
-
-// findContractReceipt 在 ContractReceipts slice 中查找指定 key 的 receipt
-func findContractReceipt(items []*types.ContractReceiptItem, key string) *types.SmartContractReceipt {
-	for _, item := range items {
-		if item == nil {
-			continue
-		}
-		// 支持完整匹配或后缀匹配（兼容 txid:contract:outputIndex 和 contract:outputIndex 两种格式）
-		if item.Key == key || strings.HasSuffix(item.Key, key) || strings.HasSuffix(key, item.Key) {
-			return item.Receipt
-		}
 	}
 	return nil
 }
