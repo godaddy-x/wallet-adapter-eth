@@ -22,6 +22,7 @@ package scanner
 //    - 合约创建：检测 to 为空的情况，捕获 contractAddress，并为新合约生成入账记录（如果被监控）
 //    - 数据校验：通过 validateAddrAmtMatch 强制校验 FromAddr/FromAmt 和 ToAddr/ToAmt 长度一致
 //    - 通过 ScanTargetFunc 仅对关心的地址/账户（AccountID=SourceKey）生成记录，并按 SourceKey 聚合
+//      返回 *ScanTargetResult 指针，nil 表示该地址未监控（不生成记录），非 nil 则包含 SourceKey 归属信息
 //
 // 3. 验证与对账层（Verify-level）：
 //    - VerifyTransactionByTxID：按 txid + minConfirmations 从链上二次复核（存在 / 成功 / 确认数），
@@ -42,7 +43,7 @@ package scanner
 // 整体原则：
 // - 正确性优先：宁可跳过未知精度的 Token / 失败交易 / 未上链交易，也不猜测或“硬入账”
 // - 统一口径：所有 Tx 提取与 Verify 均复用 ExtractTransactionAndReceiptData，保证“扫块入口”和“按 txid 复核入口”结果一致
-// - 成本可控：仅在命中 ScanTargetFunc 的 tx 上跑深度提取；通过缓存与窗口策略减少重复 RPC
+// - 成本可控：仅在 ScanTargetFunc 返回非 nil（地址命中监控目标）的 tx 上跑深度提取；通过缓存与窗口策略减少重复 RPC
 
 import (
 	"encoding/hex"
@@ -129,6 +130,7 @@ type EthBlockScanner struct {
 // - 回执 status 必须成功；
 // - confirmations >= minConfirmations；
 // - 使用与扫块一致的提取逻辑 ExtractTransactionAndReceiptData 生成结果集，保证口径一致。
+// 关于 scanTargetFunc 参数：优先使用 bs.ScanTargetFunc（若已设置），否则使用传入的参数。
 func (bs *EthBlockScanner) VerifyTransactionByTxID(txid string, scanTargetFunc adaptscanner.BlockScanTargetFunc, minConfirmations uint64) (*types.TxVerifyResult, error) {
 	res := &types.TxVerifyResult{
 		Symbol:           "",
@@ -151,7 +153,12 @@ func (bs *EthBlockScanner) VerifyTransactionByTxID(txid string, scanTargetFunc a
 	if bs.wm.Config == nil {
 		return res, fmt.Errorf("wallet manager config is nil")
 	}
-	if scanTargetFunc == nil {
+	// 优先使用 bs.ScanTargetFunc（通过 SetBlockScanTargetFunc 设置），如果未设置则使用传入的参数
+	effectiveScanTargetFunc := bs.ScanTargetFunc
+	if effectiveScanTargetFunc == nil {
+		effectiveScanTargetFunc = scanTargetFunc
+	}
+	if effectiveScanTargetFunc == nil {
 		return res, fmt.Errorf("scan target func is nil")
 	}
 
@@ -209,7 +216,7 @@ func (bs *EthBlockScanner) VerifyTransactionByTxID(txid string, scanTargetFunc a
 	}
 
 	// 4) 使用同一套提取逻辑生成结果集（口径一致）
-	extractData, contractReceipts, extractErr := bs.ExtractTransactionAndReceiptData(txid, scanTargetFunc)
+	extractData, contractReceipts, extractErr := bs.ExtractTransactionAndReceiptData(txid, effectiveScanTargetFunc)
 	if extractErr != nil {
 		res.Reason = "extract failed: " + extractErr.Error()
 		return res, nil
@@ -222,6 +229,7 @@ func (bs *EthBlockScanner) VerifyTransactionByTxID(txid string, scanTargetFunc a
 
 // VerifyTransactionMatch 在 VerifyTransactionByTxID 基础上，将链上提取到的主币/代币转账与 expected 做严格比对。
 // 比对范围：txid、blockHeight、blockHash、以及 transfers 的 from/to/amount（主币或指定合约代币）。
+// 关于 scanTargetFunc 参数：优先使用 bs.ScanTargetFunc（若已设置），否则使用传入的参数。
 func (bs *EthBlockScanner) VerifyTransactionMatch(txid string, expected *types.TxVerifyExpected, scanTargetFunc adaptscanner.BlockScanTargetFunc, minConfirmations uint64) (*types.TxVerifyMatchResult, error) {
 	out := &types.TxVerifyMatchResult{
 		TxID:       txid,
@@ -449,7 +457,7 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 	res.Header = header
 	confirmTime := int64(timestamp)
 
-	// 2) 逐笔提取交易（仅在设置 ScanTargetFunc 时进行；统计失败与提取数量，供外部观测）
+	// 2) 逐笔提取交易（仅在通过 SetBlockScanTargetFunc 设置 ScanTargetFunc 时进行；统计失败与提取数量，供外部观测）
 	// 注意：ScanBlockWithResult 为“同步返回结果集”模式，不在此处做异步通知推送。
 	if bs.ScanTargetFunc != nil {
 		txs := result.Get("transactions").Array()
@@ -572,7 +580,8 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 // extractTransactionAndReceiptDataFromBlockTx 块内提取优化路径（用于 ScanBlockWithResult）：
 // - tx 对象来自 eth_getBlockByNumber(height,true) 的 transactions 列表，已包含 from/to/value/gasPrice 等字段；
 // - 因此这里不再调用 eth_getTransactionByHash，仅调用 eth_getTransactionReceipt 获取回执与 logs；
-// - confirmTime 由区块 timestamp 提供，避免 per-tx 调用 eth_getBlockByHash。
+// - confirmTime 由区块 timestamp 提供，避免 per-tx 调用 eth_getBlockByHash；
+// - scanTargetFunc：地址监控函数，返回 nil 表示地址未监控，非 nil 时 SourceKey 标识归属账户。
 func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 	txNode gjson.Result,
 	blockHash string,
@@ -1432,6 +1441,12 @@ func extractAddressFromTopic(topic string) string {
 
 // ExtractTransactionAndReceiptData 按 txid 精准提取“可入账交易单 + 合约回执”，并按 SourceKey(AccountID) 聚合。
 //
+// 关于 scanTargetFunc 参数：
+//   - 优先使用通过 SetBlockScanTargetFunc 设置的 bs.ScanTargetFunc
+//   - 若未设置（nil），则使用本方法传入的 scanTargetFunc 参数
+//   - 两者都不可用时返回错误
+//   - ScanTargetFunc 返回 *ScanTargetResult 指针：nil 表示该地址未监控，非 nil 时 SourceKey 字段标识归属账户
+//
 // 提取规则：
 // 1. 过滤条件：
 //   - 交易必须已上链（blockNumber / blockHash 非空），否则直接返回 nil（pending 由上层单独处理）
@@ -1440,7 +1455,7 @@ func extractAddressFromTopic(topic string) string {
 // 2. 主币（ETH）：
 //   - 根据 tx.from / tx.to / value 解析出主币金额（按 SymbolDecimal() 格式化为十进制字符串）
 //   - 仅当 value>0 且 from 非空时才视为一笔主币转账
-//   - 通过 ScanTargetFunc(symbol, from/to) 判断地址归属哪个 AccountID(SourceKey)：
+//   - 通过 ScanTargetFunc(symbol, from/to) 判断地址归属哪个 AccountID(SourceKey)，返回 *ScanTargetResult（nil 表示未监控）：
 //   - 若 from 与 to 归属同一 SourceKey：只生成一条记录（FromAddr=[from], FromAmt=[amount], ToAddr=[to], ToAmt=[amount]），TxAction="internal"
 //   - 若归属不同 SourceKey：from 账户生成出账记录（TxAction="send"），to 账户生成入账记录（TxAction="receive"）
 //   - 主币记录 Fees="0"，OutputIndex=-1，手续费统一通过 GAS 记录归集
@@ -1451,7 +1466,7 @@ func extractAddressFromTopic(topic string) string {
 //
 // 3. 手续费（GAS）：
 //   - 手续费按 gasUsed * effectiveGasPrice（receipt 中优先，fallback 到 tx.gasPrice）计算为 feeWei，并按 SymbolDecimal() 格式化为 feeStr
-//   - 无论是否包含主币转账，只要 tx 成功且 tx.from 命中 ScanTargetFunc，都会为该 AccountID 生成一条独立 GAS 记录：
+//   - 无论是否包含主币转账，只要 tx 成功且 tx.from 被 ScanTargetFunc 监控（返回非 nil），都会为该 AccountID 生成一条独立 GAS 记录：
 //   - Coin = 原生币（ethCoin）
 //   - Amount = "0"
 //   - Fees   = feeStr
@@ -1472,7 +1487,7 @@ func extractAddressFromTopic(topic string) string {
 //   - 优先使用业务注入的 TokenMetadataFunc(symbol, contractAddr)
 //   - 否则回退链上 ERC20Metadata(contractAddr)
 //   - decimals<=0 或查询失败时跳过该事件（绝不猜测默认 18）
-//   - 通过 ScanTargetFunc(contractAddr, fromToken/toToken) 判断代币归属的 AccountID：
+//   - 通过 ScanTargetFunc(contractAddr, fromToken/toToken) 判断代币归属的 AccountID（返回 nil 表示未监控）：
 //   - from 命中：在该 SourceKey 下生成一条 FromAddr=[fromToken], FromAmt=[amountStr], ToAddr=[toToken], ToAmt=[amountStr] 的记录，TxAction="send"（内部转账则为"internal"）
 //   - to 命中：在该 SourceKey 下同样生成一条 FromAddr=[fromToken], FromAmt=[amountStr], ToAddr=[toToken], ToAmt=[amountStr] 的记录，TxAction="receive"
 //     （两者 From/To 均完整填充，通过 TxAction 区分方向，便于按 AccountID 维度独立入账）
@@ -1489,11 +1504,16 @@ func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTar
 	if bs.wm == nil || bs.wm.Client == nil {
 		return nil, nil, fmt.Errorf("wallet manager or rpc client is nil")
 	}
-	if scanTargetFunc == nil {
-		return nil, nil, fmt.Errorf("scan target func is nil")
-	}
 	if bs.wm.Config == nil {
 		return nil, nil, fmt.Errorf("wallet manager config is nil")
+	}
+	// 优先使用 bs.ScanTargetFunc（通过 SetBlockScanTargetFunc 设置），如果未设置则使用传入的参数
+	effectiveScanTargetFunc := bs.ScanTargetFunc
+	if effectiveScanTargetFunc == nil {
+		effectiveScanTargetFunc = scanTargetFunc
+	}
+	if effectiveScanTargetFunc == nil {
+		return nil, nil, fmt.Errorf("scan target func is nil")
 	}
 
 	// 1. 获取交易与回执
@@ -1577,11 +1597,12 @@ func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTar
 
 	// 如果查询不到区块时间，默认设为 0（上层业务逻辑需要处理时间为 0 的情况）
 	confirmTime := bs.getBlockTimestamp(blockHash, 0)
-	return bs.extractTransactionAndReceiptDataFromParsed(txid, from, to, amount, amountStr, blockHash, blockHeight, confirmTime, fee, feeStr, status, rcRes, scanTargetFunc)
+	return bs.extractTransactionAndReceiptDataFromParsed(txid, from, to, amount, amountStr, blockHash, blockHeight, confirmTime, fee, feeStr, status, rcRes, effectiveScanTargetFunc)
 }
 
 // extractTransactionAndReceiptDataFromParsed 统一的“生成结果集”逻辑（扫块/verify 复用）。
-// 输入已解析好的 tx 基础字段 + receipt（用于 logs/status/gasUsed 等），输出交易单与合约回执集合（直接生成 slice，无 map 转换）。
+// 输入已解析好的 tx 基础字段 + receipt（用于 logs/status/gasUsed 等），输出交易单与合约回执集合（直接生成 slice，无 map 转换）；
+// scanTargetFunc：地址监控函数，返回 nil 表示地址未监控（不生成记录），非 nil 时包含 SourceKey 归属信息。
 func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	txid string,
 	from string,
@@ -1632,7 +1653,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	if from != "" && fee != nil && fee.Sign() > 0 {
 		fromFeeParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, from)
 		fromFeeRes := scanTargetFunc(fromFeeParam)
-		if fromFeeRes.Exist {
+		if fromFeeRes != nil {
 			feeTxObj := &types.Transaction{
 				TxID:        txid,
 				AccountID:   fromFeeRes.SourceKey,
@@ -1662,12 +1683,12 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	// 3. 主币转账
 	if amount != nil && amount.Sign() > 0 && from != "" {
 		actualTo := to
-		var toRes types.ScanTargetResult
+		var toRes *types.ScanTargetResult
 		toResExist := false
 		if actualTo != "" {
 			toParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, actualTo)
 			toRes = scanTargetFunc(toParam)
-			toResExist = toRes.Exist
+			toResExist = toRes != nil
 		}
 
 		isContractCreation := actualTo == ""
@@ -1683,43 +1704,43 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				"contract_address":  createdAddr,
 			}
 
-			// 检查新创建的合约地址是否被监控（重要：合约创建时转入的 ETH 归属）
+		// 检查新创建的合约地址是否被监控（重要：合约创建时转入的 ETH 归属）
 			if createdAddr != "" {
 				createdParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, createdAddr)
 				createdRes := scanTargetFunc(createdParam)
-				if createdRes.Exist {
-					// 为创建的合约地址生成 receive 记录（入账）
-					txObj := &types.Transaction{
-						TxID:        txid,
-						AccountID:   createdRes.SourceKey,
-						Coin:        ethCoin,
-						BlockHash:   blockHash,
-						BlockHeight: blockHeight,
-						Amount:      amountStr,
-						Decimal:     bs.wm.SymbolDecimal(),
-						Fees:        "0",
-						FromAddr:    []string{from},
-						FromAmt:     []string{amountStr},
-						ToAddr:      []string{createdAddr},
-						ToAmt:       []string{amountStr},
-						Status:      status,
-						ConfirmTime: confirmTime,
-						TxAction:    "receive", // 合约创建时的 ETH 入账
-						OutputIndex: -1,
-						ExtParam:    ext,
-					}
+				if createdRes != nil {
+				// 为创建的合约地址生成 receive 记录（入账）
+				txObj := &types.Transaction{
+					TxID:        txid,
+					AccountID:   createdRes.SourceKey,
+					Coin:        ethCoin,
+					BlockHash:   blockHash,
+					BlockHeight: blockHeight,
+					Amount:      amountStr,
+					Decimal:     bs.wm.SymbolDecimal(),
+					Fees:        "0",
+					FromAddr:    []string{from},
+					FromAmt:     []string{amountStr},
+					ToAddr:      []string{createdAddr},
+					ToAmt:       []string{amountStr},
+					Status:      status,
+					ConfirmTime: confirmTime,
+					TxAction:    "receive", // 合约创建时的 ETH 入账
+					OutputIndex: -1,
+					ExtParam:    ext,
+				}
 					data := types.NewTxExtractData()
-					data.Transaction = txObj
-					appendExtractData(createdRes.SourceKey, data)
+				data.Transaction = txObj
+				appendExtractData(createdRes.SourceKey, data)
 				}
 			}
 		}
 
 		fromParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, from)
 		fromRes := scanTargetFunc(fromParam)
-		if fromRes.Exist {
+		if fromRes != nil {
 			// 判断是否为内部转账（双方属于同一账户）
-			isInternal := toResExist && toRes.SourceKey == fromRes.SourceKey
+			isInternal := toResExist && toRes != nil && toRes.SourceKey == fromRes.SourceKey
 			txAction := "send"
 			if isInternal {
 				txAction = "internal"
@@ -1749,7 +1770,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 		}
 
 		if toResExist && actualTo != "" {
-			if !fromRes.Exist || toRes.SourceKey != fromRes.SourceKey {
+			if fromRes == nil || toRes.SourceKey != fromRes.SourceKey {
 				txObj := &types.Transaction{
 					TxID:        txid,
 					AccountID:   toRes.SourceKey,
@@ -1854,9 +1875,9 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 		toRes := scanTargetFunc(toParam)
 
 		// 判断是否为内部转账（双方属于同一账户）
-		isInternalToken := fromRes.Exist && toRes.Exist && fromRes.SourceKey == toRes.SourceKey
+		isInternalToken := fromRes != nil && toRes != nil && fromRes.SourceKey == toRes.SourceKey
 
-		if fromRes.Exist {
+		if fromRes != nil {
 			txAction := "send"
 			if isInternalToken {
 				txAction = "internal"
@@ -1883,7 +1904,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			data.Transaction = txObj
 			appendExtractData(fromRes.SourceKey, data)
 		}
-		if toRes.Exist && !isInternalToken {
+		if toRes != nil && !isInternalToken {
 			txObj := &types.Transaction{
 				TxID:        txid,
 				AccountID:   toRes.SourceKey,
