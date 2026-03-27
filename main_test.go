@@ -20,8 +20,8 @@ import (
 // testConfigJSON 为本仓库本地节点集成测试的通用 JSON 配置。
 // 如需切换节点端口/数据目录，只需修改此处。
 const testConfigJSON = `{
-  "serverAPI": "http://127.0.0.1:8547",
-  "broadcastAPI": "http://127.0.0.1:8547",
+  "serverAPI": "http://43.135.98.105:8547",
+  "broadcastAPI": "http://43.135.98.105:8547",
   "fixGasLimit": "",
   "dataDir": "E://test/",
   "fixGasPrice": "",
@@ -35,18 +35,17 @@ const testConfigJSON = `{
 }`
 
 const testHeight = 651
-const testHeightToken = 88356
+const testHeightToken = 426525
 
 // TestStartBlockScanner 演示如何在业务侧完整初始化适配器和扫块器：
 // - 通过 eth.NewAdapter 创建适配器（内部构造 EthBlockScanner）；
 // - 设置 ScanTargetFunc：告诉扫块器“哪些地址/合约是我关心的扫描目标”（本用例不关心交易提取，因此默认都不匹配）；
-// - 设置 TokenMetadataFunc（在 Base 上，由外部业务注入）：提供代币精度等元数据（本用例返回 nil，回退链上元数据查询）；
 // - 实际连本地节点：获取 latest 区块头并执行一次 ScanBlock，验证扫块流程可跑通。
 func TestStartBlockScanner(t *testing.T) {
 	// 复用 main.go 中的 demo 配置（本地节点地址可按需要调整）
 	const configJSON = testConfigJSON
 
-	// 创建适配器（内部会构造 EthBlockScanner，但此时尚未设置 ScanTargetFunc 与 TokenMetadataFunc）
+	// 创建适配器（内部会构造 EthBlockScanner，但此时尚未设置 ScanTargetFunc）
 	adapter, err := eth.NewAdapter(configJSON, "ETH", "Ethereum", 18)
 	if err != nil {
 		t.Fatalf("NewAdapter error: %v", err)
@@ -64,13 +63,7 @@ func TestStartBlockScanner(t *testing.T) {
 		return nil
 	})
 
-	// 2）设置 TokenMetadataFunc：本用例返回 nil，表示业务侧不做兜底配置，回退链上 ERC20Metadata（若链上也查不到则会跳过该事件）
-	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract {
-		// 在真实业务中，这里应根据 symbol+contractAddr 查内部资产表，返回已配置的 SmartContract 信息。
-		return nil
-	})
-
-	// 3）连节点取 latest 区块并扫一次（同步返回结果集）
+	// 2）连节点取 latest 区块并扫一次（同步返回结果集）
 	start := time.Now()
 	header, err := bs.GetCurrentBlockHeader()
 	if err != nil {
@@ -111,11 +104,16 @@ func TestScanBlockWithResultFlow(t *testing.T) {
 
 	// 为了让扫块器真正跑提取逻辑，这里让 ScanTargetFunc “全部命中”，避免 ExtractData 永远为空。
 	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
+		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+			return &types.ScanTargetResult{
+				SourceKey: "test",
+				TargetInfo: &types.SmartContract{
+					Address:  strings.ToLower(target.ScanTarget),
+					Decimals: 18,
+				},
+			}
+		}
 		return &types.ScanTargetResult{SourceKey: "test"}
-	})
-	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract {
-		// 测试环境不提供业务侧元数据兜底，回退链上 ERC20Metadata；若获取不到 decimals 则跳过该 token 事件
-		return nil
 	})
 
 	header, err := bs.GetCurrentBlockHeader()
@@ -171,9 +169,17 @@ func TestVerifyTransactionByTxID(t *testing.T) {
 
 	// 全命中，确保能产出结果集（注意：Verify 仍会受"tx 是否成功/确认数"影响）
 	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
+		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+			return &types.ScanTargetResult{
+				SourceKey: "test",
+				TargetInfo: &types.SmartContract{
+					Address:  strings.ToLower(target.ScanTarget),
+					Decimals: 18,
+				},
+			}
+		}
 		return &types.ScanTargetResult{SourceKey: "test"}
 	})
-	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
 
 	// 从 latest block 中选择一个 txid：这里通过 ScanBlockWithResult 无法拿到 txid，因此直接用扫块器内部 RPC（已通过接口封装）：
 	// 使用链上接口：先取 latest header，再用区块号拉区块并取第一笔 tx hash。
@@ -231,9 +237,17 @@ func TestVerifyTransactionMatch(t *testing.T) {
 		t.Fatalf("unexpected BlockScanner type: %T", rawScanner)
 	}
 	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
+		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+			return &types.ScanTargetResult{
+				SourceKey: "test",
+				TargetInfo: &types.SmartContract{
+					Address:  strings.ToLower(target.ScanTarget),
+					Decimals: 18,
+				},
+			}
+		}
 		return &types.ScanTargetResult{SourceKey: "test"}
 	})
-	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
 
 	// 取 latest 区块第一笔 txid
 	header, err := bs.GetCurrentBlockHeader()
@@ -349,12 +363,20 @@ func TestScanBlockOnce(t *testing.T) {
 
 	// 全命中，确保能产出结果集（若本地节点对应高度无交易也可正常返回）。
 	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
+		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+			return &types.ScanTargetResult{
+				SourceKey: "test2",
+				TargetInfo: &types.SmartContract{
+					Address:  strings.ToLower(target.ScanTarget),
+					Decimals: 18,
+				},
+			}
+		}
 		if target.ScanTarget == "0x301db155664284b1462e1a10c082a9ff6e2b617f" {
 			return &types.ScanTargetResult{SourceKey: "test1"}
 		}
 		return &types.ScanTargetResult{SourceKey: "test2"}
 	})
-	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
 
 	start := time.Now()
 	res, err := rawScanner.ScanBlockOnce(uint64(testHeight))
@@ -405,12 +427,20 @@ func TestScanBlockOnceToken(t *testing.T) {
 
 	// 全命中，确保能产出结果集（若本地节点对应高度无交易也可正常返回）。
 	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
-		if target.ScanTarget == "0x301db155664284b1462e1a10c082a9ff6e2b617f" {
+		if target.ScanTargetType == types.ScanTargetTypeAccountAddress {
 			return &types.ScanTargetResult{SourceKey: "test1"}
+		}
+		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+			return &types.ScanTargetResult{
+				SourceKey: "test2",
+				TargetInfo: &types.SmartContract{
+					Address:  strings.ToLower(target.ScanTarget),
+					Decimals: 18,
+				},
+			}
 		}
 		return &types.ScanTargetResult{SourceKey: "test2"}
 	})
-	_ = bs.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
 
 	start := time.Now()
 	res, err := rawScanner.ScanBlockOnce(uint64(testHeightToken))
@@ -454,9 +484,17 @@ func TestRunScanLoopContinuously(t *testing.T) {
 
 	// 让扫块器真正运行提取逻辑（可根据本地节点情况调整）。
 	_ = rawScanner.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
+		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+			return &types.ScanTargetResult{
+				SourceKey: "test",
+				TargetInfo: &types.SmartContract{
+					Address:  strings.ToLower(target.ScanTarget),
+					Decimals: 18,
+				},
+			}
+		}
 		return &types.ScanTargetResult{SourceKey: "test"}
 	})
-	_ = rawScanner.SetTokenMetadataFunc(func(symbol, contractAddr string) *types.SmartContract { return nil })
 
 	latest := rawScanner.GetGlobalMaxBlockHeight()
 	if latest < 2 {

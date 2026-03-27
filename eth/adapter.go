@@ -29,7 +29,6 @@ type EthAdapter struct {
 }
 
 // NewEthAdapter 创建以太坊链适配器（仅设 symbol/fullName/decimals，Config 与 RPC 客户端由 LoadAssetsConfig 回调初始化）。
-// TokenMetadataFunc 现由外部在 scanner.Base 层统一注入（与 ScanTargetFunc 一致），此处仅负责构造 EthBlockScanner。
 func NewEthAdapter(symbol, fullName string, decimals int32) *EthAdapter {
 	cfg := config.NewConfig(symbol)
 	wm := &manager.WalletManager{Config: cfg, Client: nil}

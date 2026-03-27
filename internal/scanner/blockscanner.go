@@ -12,8 +12,8 @@ package scanner
 //   - 方向标记：TxAction(send/receive/internal/fee) 标识交易方向
 //   - 输出索引：OutputIndex(-2=手续费, -1=主币, 0+=合约事件)
 //   - 手续费独立：GAS 记录单独生成，避免在多条 Token 记录上重复计费
-//   - 安全原则：未知精度代币/失败交易直接跳过，不猜测入账
-//   - 缓存优化：tokenDecimalsCache、blockTimestampCache 减少重复 RPC
+//   - 安全原则：失败交易直接跳过；代币精度必须由业务层 TargetInfo 明确提供
+//   - 缓存优化：blockTimestampCache 减少重复 RPC
 
 import (
 	"context"
@@ -37,7 +37,7 @@ import (
 // 嵌入 Base 复用任务调度，通过 WalletManager 进行 RPC 查询与交易提取。
 type EthBlockScanner struct {
 	*adaptscanner.Base
-	// wm 提供 RPC 与 ERC20 元数据查询能力
+	// wm 提供 RPC 查询能力
 	wm *manager.WalletManager
 
 	// scannedHeight Run() 周期任务使用的内存游标（非持久化，仅用于自动追块场景）
@@ -52,12 +52,6 @@ type EthBlockScanner struct {
 
 	// TxExtractConcurrency 单区块内并行提取交易的并发度（<=0 使用默认值）
 	TxExtractConcurrency int
-
-	// tokenDecimalsCache 合约精度缓存（>0=有效, 0=查询失败/非标准，调用方需跳过）
-	tokenDecimalsCache      map[string]int32
-	tokenDecimalsCacheMu    sync.RWMutex
-	tokenDecimalsCacheMax   int      // 缓存上限，避免内存无限增长
-	tokenDecimalsCacheOrder []string // FIFO 淘汰顺序
 
 	// blockTimestampCache 区块时间戳缓存（FIFO 淘汰策略）
 	blockTimestampCache      map[string]int64
@@ -175,52 +169,52 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 
 		var wg sync.WaitGroup
 		wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go func() {
-			defer wg.Done()
-			for txNode := range jobs {
-				txHash := txNode.Get("hash").String()
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				for txNode := range jobs {
+					txHash := txNode.Get("hash").String()
 
-				// 使用超时上下文防止单个交易处理阻塞太久
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				type result struct {
-					ed      []*types.ExtractDataItem
-					cr      []*types.ContractReceiptItem
-					matched bool
-					err     error
+					// 使用超时上下文防止单个交易处理阻塞太久
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					type result struct {
+						ed      []*types.ExtractDataItem
+						cr      []*types.ContractReceiptItem
+						matched bool
+						err     error
+					}
+					resChan := make(chan result, 1)
+
+					go func(node gjson.Result) {
+						defer func() {
+							if r := recover(); r != nil {
+								resChan <- result{err: fmt.Errorf("panic: %v", r)}
+							}
+						}()
+						ed, cr, matched, e := bs.extractTransactionAndReceiptDataFromBlockTx(node, hash, blockHeight, confirmTime, bs.ScanTargetFunc)
+						resChan <- result{ed: ed, cr: cr, matched: matched, err: e}
+					}(txNode)
+
+					var outResult result
+					select {
+					case outResult = <-resChan:
+						// 正常完成
+					case <-ctx.Done():
+						// 超时
+						outResult = result{err: fmt.Errorf("extract transaction timeout: %s", txHash)}
+					}
+					cancel()
+
+					outs <- txExtractOut{
+						txHash:           txHash,
+						extractData:      outResult.ed,
+						contractReceipts: outResult.cr,
+						err:              outResult.err,
+						matched:          outResult.matched,
+					}
 				}
-				resChan := make(chan result, 1)
-
-				go func(node gjson.Result) {
-					defer func() {
-						if r := recover(); r != nil {
-							resChan <- result{err: fmt.Errorf("panic: %v", r)}
-						}
-					}()
-					ed, cr, matched, e := bs.extractTransactionAndReceiptDataFromBlockTx(node, hash, blockHeight, confirmTime, bs.ScanTargetFunc)
-					resChan <- result{ed: ed, cr: cr, matched: matched, err: e}
-				}(txNode)
-
-				var outResult result
-				select {
-				case outResult = <-resChan:
-					// 正常完成
-				case <-ctx.Done():
-					// 超时
-					outResult = result{err: fmt.Errorf("extract transaction timeout: %s", txHash)}
-				}
-				cancel()
-
-				outs <- txExtractOut{
-					txHash:           txHash,
-					extractData:      outResult.ed,
-					contractReceipts: outResult.cr,
-					err:              outResult.err,
-					matched:          outResult.matched,
-				}
-			}
-		}()
-	}
+			}()
+		}
 
 		go func() {
 			for _, txNode := range txNodes {
@@ -395,17 +389,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 	return bs.extractTransactionAndReceiptDataFromParsed(txid, from, to, amount, amountStr, blockHash, blockHeight, confirmTime, fee, feeStr, status, rcRes, scanTargetFunc)
 }
 
-// TokenMetadataFunc 现由外部在 Base 上统一注入（与 ScanTargetFunc 一致），此处仅依赖其存在而不再单独持有。
+// NewBlockScanner 构造以太坊区块扫描器。
 func NewBlockScanner(wm *manager.WalletManager) *EthBlockScanner {
 	bs := &EthBlockScanner{
-		Base:                    adaptscanner.NewBlockScannerBase(),
-		wm:                      wm,
-		TxExtractConcurrency:    10,
-		tokenDecimalsCache:      make(map[string]int32),
-		tokenDecimalsCacheMax:   1024,
-		tokenDecimalsCacheOrder: make([]string, 0, 1024),
-		blockTimestampCache:     make(map[string]int64),
-		blockTimestampCacheMax:  1024,
+		Base:                   adaptscanner.NewBlockScannerBase(),
+		wm:                     wm,
+		TxExtractConcurrency:   10,
+		blockTimestampCache:    make(map[string]int64),
+		blockTimestampCacheMax: 1024,
 	}
 	bs.scanLoopCond = sync.NewCond(&bs.scanLoopMu)
 	bs.scanLoopPauseCh = make(chan struct{})
@@ -509,81 +500,6 @@ func (bs *EthBlockScanner) SetTxExtractConcurrency(n int) {
 	bs.TxExtractConcurrency = n
 }
 
-// getTokenDecimals 返回合约代币精度（带缓存）。查询失败返回 (0, false)，调用方需跳过该代币。
-func (bs *EthBlockScanner) getTokenDecimals(contractAddr string) (int32, bool) {
-	if contractAddr == "" || bs.wm == nil {
-		return 0, false
-	}
-
-	// 验证合约地址格式
-	if !isValidAddress(contractAddr) {
-		return 0, false
-	}
-
-	bs.tokenDecimalsCacheMu.RLock()
-	d, ok := bs.tokenDecimalsCache[contractAddr]
-	bs.tokenDecimalsCacheMu.RUnlock()
-	if ok {
-		if d > 0 {
-			return d, true
-		}
-		return 0, false
-	}
-
-	// 1) 优先使用 TokenMetadataFunc
-	if bs.TokenMetadataFunc != nil && bs.wm.Config != nil {
-		if sc := bs.TokenMetadataFunc(bs.wm.Config.Symbol, contractAddr); sc != nil && sc.Decimals > 0 {
-			decimals := int32(sc.Decimals)
-			bs.setTokenDecimalsCache(contractAddr, decimals)
-			return decimals, true
-		}
-	}
-
-	// 2) 查询链上 ERC20 metadata
-	_, _, dec, err := bs.wm.ERC20Metadata(contractAddr)
-	if err != nil || dec == 0 {
-		fmt.Printf("[EthBlockScanner] getTokenDecimals failed for contract %s: %v, decimals=%d\n", contractAddr, err, dec)
-		bs.setTokenDecimalsCache(contractAddr, 0)
-		return 0, false
-	}
-
-	decimals := int32(dec)
-	bs.setTokenDecimalsCache(contractAddr, decimals)
-	return decimals, true
-}
-
-// setTokenDecimalsCache 带 FIFO 淘汰策略的缓存写入
-func (bs *EthBlockScanner) setTokenDecimalsCache(contractAddr string, decimals int32) {
-	bs.tokenDecimalsCacheMu.Lock()
-	defer bs.tokenDecimalsCacheMu.Unlock()
-
-	if _, exists := bs.tokenDecimalsCache[contractAddr]; exists {
-		bs.tokenDecimalsCache[contractAddr] = decimals
-		// 更新访问顺序：移到队尾表示最近访问
-		for i, addr := range bs.tokenDecimalsCacheOrder {
-			if addr == contractAddr {
-				// 移除当前位置
-				bs.tokenDecimalsCacheOrder = append(bs.tokenDecimalsCacheOrder[:i], bs.tokenDecimalsCacheOrder[i+1:]...)
-				break
-			}
-		}
-		bs.tokenDecimalsCacheOrder = append(bs.tokenDecimalsCacheOrder, contractAddr)
-		return
-	}
-
-	// FIFO 淘汰
-	if bs.tokenDecimalsCacheMax > 0 && len(bs.tokenDecimalsCache) >= bs.tokenDecimalsCacheMax {
-		if len(bs.tokenDecimalsCacheOrder) > 0 {
-			oldest := bs.tokenDecimalsCacheOrder[0]
-			delete(bs.tokenDecimalsCache, oldest)
-			bs.tokenDecimalsCacheOrder = bs.tokenDecimalsCacheOrder[1:]
-		}
-	}
-
-	bs.tokenDecimalsCache[contractAddr] = decimals
-	bs.tokenDecimalsCacheOrder = append(bs.tokenDecimalsCacheOrder, contractAddr)
-}
-
 // isValidAddress 验证以太坊地址格式
 func isValidAddress(addr string) bool {
 	if addr == "" {
@@ -603,6 +519,38 @@ func isValidAddress(addr string) bool {
 		return false
 	}
 	return true
+}
+
+// getContractMetaFromTargetInfo 从 ScanTargetResult.TargetInfo 中提取合约元数据。
+// 约定：TargetInfo 必须是 types.SmartContract 或 *types.SmartContract，且 Decimals > 0。
+func getContractMetaFromTargetInfo(contractAddr string, targetInfo interface{}) (*types.SmartContract, error) {
+	if targetInfo == nil {
+		return nil, fmt.Errorf("contract target matched but TargetInfo is nil")
+	}
+
+	var meta *types.SmartContract
+	switch v := targetInfo.(type) {
+	case *types.SmartContract:
+		meta = v
+	case types.SmartContract:
+		tmp := v
+		meta = &tmp
+	default:
+		return nil, fmt.Errorf("unsupported TargetInfo type %T, need types.SmartContract", targetInfo)
+	}
+
+	if meta.Decimals == 0 {
+		return nil, fmt.Errorf("contract metadata decimals is 0")
+	}
+
+	// 若业务层未填地址，回填当前日志里的合约地址；若填了且不一致，直接报错。
+	if meta.Address == "" {
+		meta.Address = contractAddr
+	} else if !strings.EqualFold(meta.Address, contractAddr) {
+		return nil, fmt.Errorf("contract metadata address mismatch: meta=%s log=%s", meta.Address, contractAddr)
+	}
+	meta.Address = strings.ToLower(meta.Address)
+	return meta, nil
 }
 
 // RunScanLoop 从外部指定的 StartHeight 开始（inclusive），持续按高度向上扫描，并始终只扫描已满足 Confirmations 的安全范围。
@@ -1622,31 +1570,32 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			continue
 		}
 
-		tokenDecimals, ok := bs.getTokenDecimals(contractAddr)
-		if !ok || tokenDecimals <= 0 {
-			fmt.Printf("[EthBlockScanner] skip ERC20 Transfer for contract %s due to unknown decimals\n", contractAddr)
+		// 先做合约白名单校验：type=contract, symbol=eth, scanTarget=contractAddr
+		contractParam := types.NewScanTargetParamForContract(bs.wm.Config.Symbol, contractAddr)
+		contractRes := scanTargetFunc(contractParam)
+		if contractRes == nil {
+			// 合约未命中（非白名单）直接跳过该 ERC20 事件
 			continue
 		}
+
+		// 必须由业务层在 TargetInfo 返回合约元数据（含 decimals）；缺失则报错给上层。
+		contractMeta, err := getContractMetaFromTargetInfo(contractAddr, contractRes.TargetInfo)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("invalid contract TargetInfo for %s: %v", contractAddr, err)
+		}
+		tokenDecimals := int32(contractMeta.Decimals)
 		tokenAmountStr := util.BigIntToDecimal(tokenAmount, tokenDecimals)
 
 		tokenCoin := types.Coin{
 			Symbol:     bs.wm.Config.Symbol,
 			IsContract: true,
-			Contract: types.SmartContract{
-				Symbol:   "",
-				Address:  contractAddr,
-				Token:    "",
-				Protocol: "",
-				Name:     "",
-				Decimals: uint64(tokenDecimals),
-			},
+			Contract:   *contractMeta,
 		}
 
-		// 使用 NewScanTargetParamForContract 让业务层能识别这是合约地址（ScanTargetTypeContractAddress）
-		// 业务层可在 ScanTargetFunc 中通过 target.ScanTargetType 区分主币/合约，实现合约白名单过滤
-		fromParam := types.NewScanTargetParamForContract(contractAddr, fromToken)
+		// 再做账户归属校验：type=account, symbol=eth, scanTarget=userAddress
+		fromParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, fromToken)
 		fromRes := scanTargetFunc(fromParam)
-		toParam := types.NewScanTargetParamForContract(contractAddr, toToken)
+		toParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, toToken)
 		toRes := scanTargetFunc(toParam)
 
 		// 判断是否为内部转账（双方属于同一账户）
