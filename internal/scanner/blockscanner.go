@@ -1,4 +1,4 @@
-package scanner
+﻿package scanner
 
 // EthBlockScanner: 以太坊/EVM 区块扫描器
 //
@@ -318,7 +318,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 		return nil, nil, false, fmt.Errorf("transaction receipt not found")
 	}
 
-	// 失败交易直接跳过
+	// 默认视为失败，仅当回执 status 明确为 0x1 时视为成功（EIP-658）
 	status := types.TxStatusFail
 	if statusHex := rcRes.Get("status").String(); statusHex != "" {
 		st, err := hexutil.DecodeUint64(statusHex)
@@ -328,9 +328,6 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 		if st == 1 {
 			status = types.TxStatusSuccess
 		}
-	}
-	if status == types.TxStatusFail {
-		return nil, nil, false, nil
 	}
 	if blockHeight == 0 || blockHash == "" {
 		return nil, nil, false, nil
@@ -356,32 +353,29 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 	if gasUsedHex := rcRes.Get("gasUsed").String(); gasUsedHex != "" {
 		gasUsed, err := hexutil.DecodeBig(gasUsedHex)
 		if err != nil {
-			fmt.Printf("[EthBlockScanner] decode gasUsed failed for tx %s: %s, err: %v\n", txid, gasUsedHex, err)
-		} else {
-			var gasPrice *big.Int
-			// EIP-1559: 优先使用 receipt.effectiveGasPrice
-			if gp := rcRes.Get("effectiveGasPrice").String(); gp != "" {
+			return nil, nil, false, fmt.Errorf("decode gasUsed hex failed: %s, err: %v", gasUsedHex, err)
+		}
+		var gasPrice *big.Int
+		// EIP-1559: 优先使用 receipt.effectiveGasPrice
+		if gp := rcRes.Get("effectiveGasPrice").String(); gp != "" {
+			decoded, err := hexutil.DecodeBig(gp)
+			if err != nil {
+				return nil, nil, false, fmt.Errorf("decode effectiveGasPrice hex failed: %s, err: %v", gp, err)
+			}
+			gasPrice = decoded
+		}
+		// 非 EIP-1559 交易或获取失败时，回退到 tx.gasPrice
+		if gasPrice == nil {
+			if gp := txNode.Get("gasPrice").String(); gp != "" {
 				decoded, err := hexutil.DecodeBig(gp)
 				if err != nil {
-					fmt.Printf("[EthBlockScanner] decode effectiveGasPrice failed for tx %s: %s, err: %v\n", txid, gp, err)
-				} else {
-					gasPrice = decoded
+					return nil, nil, false, fmt.Errorf("decode gasPrice hex failed: %s, err: %v", gp, err)
 				}
+				gasPrice = decoded
 			}
-			// 非 EIP-1559 交易或获取失败时，回退到 tx.gasPrice
-			if gasPrice == nil {
-				if gp := txNode.Get("gasPrice").String(); gp != "" {
-					decoded, err := hexutil.DecodeBig(gp)
-					if err != nil {
-						fmt.Printf("[EthBlockScanner] decode gasPrice failed for tx %s: %s, err: %v\n", txid, gp, err)
-					} else {
-						gasPrice = decoded
-					}
-				}
-			}
-			if gasPrice != nil {
-				fee = new(big.Int).Mul(gasUsed, gasPrice)
-			}
+		}
+		if gasPrice != nil {
+			fee = new(big.Int).Mul(gasUsed, gasPrice)
 		}
 	}
 	feeStr := util.BigIntToDecimal(fee, bs.wm.SymbolDecimal())
@@ -1284,11 +1278,6 @@ func (bs *EthBlockScanner) ExtractTransactionAndReceiptData(txid string, scanTar
 		}
 	}
 
-	// 性能优化与安全性：失败交易通常无需解析主币/代币日志，直接丢弃，避免上层误入账失败交易
-	if status == types.TxStatusFail {
-		return nil, nil, nil
-	}
-
 	// 入账安全前提：仅当交易已上链（有区块高度与哈希）时才输出，避免 pending 或异常数据被误当作已确认交易入账
 	if blockHeight == 0 || blockHash == "" {
 		return nil, nil, nil
@@ -1379,6 +1368,11 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			data.Transaction = feeTxObj
 			appendExtractData(fromFeeRes.SourceKey, data)
 		}
+	}
+
+	// 失败交易：仅保留手续费记录，不生成主币/ERC20 转账记录。
+	if status == types.TxStatusFail {
+		return extractData, contractReceipts, matched, nil
 	}
 
 	// 3. 主币转账
