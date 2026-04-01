@@ -1,4 +1,4 @@
-﻿package scanner
+package scanner
 
 // EthBlockScanner: 以太坊/EVM 区块扫描器
 //
@@ -12,7 +12,7 @@
 //   - 方向标记：TxAction(send/receive/internal/fee) 标识交易方向
 //   - 输出索引：OutputIndex(-2=手续费, -1=主币, 0+=合约事件)
 //   - 手续费独立：GAS 记录单独生成，避免在多条 Token 记录上重复计费
-//   - 安全原则：失败交易直接跳过；代币精度必须由业务层 TargetInfo 明确提供
+//   - 安全原则：失败交易仅保留手续费；代币精度必须由业务层 TargetInfo 明确提供
 //   - 缓存优化：blockTimestampCache 减少重复 RPC
 
 import (
@@ -153,6 +153,13 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 			}
 		}
 
+		// 预取本区块目标命中表（账户地址/合约地址各一次批量查询）+ 预拉取回执缓存，减少查询往返。
+		blockScanTargetFunc, receiptCache, ctxErr := bs.buildBlockScanTargetContext(txNodes)
+		if ctxErr != nil {
+			res.ErrorReason = ctxErr.Error()
+			return res, ctxErr
+		}
+
 		workers := bs.TxExtractConcurrency
 		if workers <= 0 {
 			workers = 10
@@ -191,7 +198,13 @@ func (bs *EthBlockScanner) ScanBlockWithResult(height uint64) (*types.BlockScanR
 								resChan <- result{err: fmt.Errorf("panic: %v", r)}
 							}
 						}()
-						ed, cr, matched, e := bs.extractTransactionAndReceiptDataFromBlockTx(node, hash, blockHeight, confirmTime, bs.ScanTargetFunc)
+						txHash := node.Get("hash").String()
+						var preloadedReceipt *gjson.Result
+						if rc, ok := receiptCache[txHash]; ok {
+							tmp := rc
+							preloadedReceipt = &tmp
+						}
+						ed, cr, matched, e := bs.extractTransactionAndReceiptDataFromBlockTx(node, hash, blockHeight, confirmTime, blockScanTargetFunc, preloadedReceipt)
 						resChan <- result{ed: ed, cr: cr, matched: matched, err: e}
 					}(txNode)
 
@@ -293,6 +306,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 	blockHeight uint64,
 	confirmTime int64,
 	scanTargetFunc adaptscanner.BlockScanTargetFunc,
+	preloadedReceipt *gjson.Result,
 ) ([]*types.ExtractDataItem, []*types.ContractReceiptItem, bool, error) {
 	if bs.wm == nil || bs.wm.Client == nil {
 		return nil, nil, false, fmt.Errorf("wallet manager or rpc client is nil")
@@ -309,10 +323,16 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromBlockTx(
 		return nil, nil, false, fmt.Errorf("tx hash empty")
 	}
 
-	// 获取回执
-	rcRes, err := bs.wm.Client.Call("eth_getTransactionReceipt", []interface{}{txid})
-	if err != nil {
-		return nil, nil, false, err
+	// 获取回执（优先使用预加载缓存）
+	var rcRes *gjson.Result
+	if preloadedReceipt != nil {
+		rcRes = preloadedReceipt
+	} else {
+		var err error
+		rcRes, err = bs.wm.Client.Call("eth_getTransactionReceipt", []interface{}{txid})
+		if err != nil {
+			return nil, nil, false, err
+		}
 	}
 	if !rcRes.Exists() || rcRes.Type == 0 {
 		return nil, nil, false, fmt.Errorf("transaction receipt not found")
@@ -401,6 +421,164 @@ func NewBlockScanner(wm *manager.WalletManager) *EthBlockScanner {
 		bs.scannedHeight = bs.GetGlobalMaxBlockHeight()
 	}
 	return bs
+}
+
+// buildBlockScanTargetContext 构建“区块级”扫描目标命中上下文：
+// - 回执缓存：避免每笔交易重复拉取回执
+// - 命中快照：地址与合约各执行一次批量查询，后续提取阶段仅走内存命中
+func (bs *EthBlockScanner) buildBlockScanTargetContext(txNodes []gjson.Result) (adaptscanner.BlockScanTargetFunc, map[string]gjson.Result, error) {
+	receiptCache := make(map[string]gjson.Result, len(txNodes))
+	base := bs.ScanTargetFunc
+	if base == nil {
+		return nil, receiptCache, nil
+	}
+
+	accountTargets := make(map[string]interface{}, len(txNodes)*2)
+	contractTargets := make(map[string]interface{}, len(txNodes))
+
+	// 第一阶段：尽量收集全块目标集合（地址/合约），并预热回执缓存。
+	const transferTopicSig = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	for _, txNode := range txNodes {
+		txHash := txNode.Get("hash").String()
+		if txHash == "" {
+			continue
+		}
+
+		from := strings.ToLower(txNode.Get("from").String())
+		to := strings.ToLower(txNode.Get("to").String())
+		if from != "" {
+			accountTargets[from] = nil
+		}
+		if to != "" {
+			accountTargets[to] = nil
+		}
+
+		rcRes, err := bs.wm.Client.Call("eth_getTransactionReceipt", []interface{}{txHash})
+		if err != nil || !rcRes.Exists() || rcRes.Type == 0 {
+			// 回执失败时保留后续按交易兜底拉取能力，这里仅跳过预热。
+			continue
+		}
+		receiptCache[txHash] = *rcRes
+
+		createdAddr := strings.ToLower(rcRes.Get("contractAddress").String())
+		if createdAddr != "" && isValidAddress(createdAddr) {
+			accountTargets[createdAddr] = nil
+		}
+
+		for _, lg := range rcRes.Get("logs").Array() {
+			if !lg.IsObject() {
+				continue
+			}
+			contractAddr := strings.ToLower(lg.Get("address").String())
+			if contractAddr != "" {
+				contractTargets[contractAddr] = nil
+			}
+			topics := lg.Get("topics").Array()
+			if len(topics) == 0 || !strings.EqualFold(topics[0].String(), transferTopicSig) {
+				continue
+			}
+			if len(topics) >= 2 {
+				fromToken := extractAddressFromTopic(topics[1].String())
+				if fromToken != "" {
+					accountTargets[fromToken] = nil
+				}
+			}
+			if len(topics) >= 3 {
+				toToken := extractAddressFromTopic(topics[2].String())
+				if toToken != "" {
+					accountTargets[toToken] = nil
+				}
+			}
+		}
+	}
+
+	accountBatch := &types.ScanTargetParam{
+		Symbol:         bs.wm.Config.Symbol,
+		ScanTargetType: types.ScanTargetTypeAccountAddress,
+		ScanTarget:     accountTargets,
+	}
+	contractBatch := &types.ScanTargetParam{
+		Symbol:         bs.wm.Config.Symbol,
+		ScanTargetType: types.ScanTargetTypeContractAddress,
+		ScanTarget:     contractTargets,
+	}
+
+	if len(accountBatch.ScanTarget) > 0 {
+		if err := base(accountBatch); err != nil {
+			return nil, nil, fmt.Errorf("batch query account targets failed: %w", err)
+		}
+	}
+	if len(contractBatch.ScanTarget) > 0 {
+		if err := base(contractBatch); err != nil {
+			return nil, nil, fmt.Errorf("batch query contract targets failed: %w", err)
+		}
+	}
+
+	// 第二阶段：返回“只读命中快照”回调，避免提取阶段触发外部查询。
+	var mu sync.RWMutex
+	return func(target *types.ScanTargetParam) error {
+		if target == nil || target.ScanTarget == nil {
+			return nil
+		}
+		// 快照中不存在的目标，按需补查一次，避免回执预热失败导致的漏提取。
+		missing := make(map[string]interface{})
+		mu.RLock()
+		switch target.ScanTargetType {
+		case types.ScanTargetTypeAccountAddress:
+			for addr := range target.ScanTarget {
+				k := strings.ToLower(addr)
+				if _, ok := accountBatch.ScanTarget[k]; !ok {
+					missing[k] = nil
+				}
+			}
+		case types.ScanTargetTypeContractAddress:
+			for addr := range target.ScanTarget {
+				k := strings.ToLower(addr)
+				if _, ok := contractBatch.ScanTarget[k]; !ok {
+					missing[k] = nil
+				}
+			}
+		}
+		mu.RUnlock()
+		if len(missing) > 0 {
+			batch := &types.ScanTargetParam{
+				Symbol:         target.Symbol,
+				ScanTargetType: target.ScanTargetType,
+				ScanTarget:     missing,
+			}
+			if err := base(batch); err != nil {
+				return fmt.Errorf("fallback batch query failed: %w", err)
+			}
+			mu.Lock()
+			switch target.ScanTargetType {
+			case types.ScanTargetTypeAccountAddress:
+				for addr, val := range batch.ScanTarget {
+					accountBatch.ScanTarget[addr] = val
+				}
+			case types.ScanTargetTypeContractAddress:
+				for addr, val := range batch.ScanTarget {
+					contractBatch.ScanTarget[addr] = val
+				}
+			}
+			mu.Unlock()
+		}
+
+		mu.RLock()
+		switch target.ScanTargetType {
+		case types.ScanTargetTypeAccountAddress:
+			for addr := range target.ScanTarget {
+				k := strings.ToLower(addr)
+				target.ScanTarget[addr] = accountBatch.ScanTarget[k]
+			}
+		case types.ScanTargetTypeContractAddress:
+			for addr := range target.ScanTarget {
+				k := strings.ToLower(addr)
+				target.ScanTarget[addr] = contractBatch.ScanTarget[k]
+			}
+		}
+		mu.RUnlock()
+		return nil
+	}, receiptCache, nil
 }
 
 func (bs *EthBlockScanner) getPauseCh() <-chan struct{} {
@@ -515,29 +693,43 @@ func isValidAddress(addr string) bool {
 	return true
 }
 
-// getContractMetaFromTargetInfo 从 ScanTargetResult.TargetInfo 中提取合约元数据。
-// 约定：TargetInfo 必须是 types.SmartContract 或 *types.SmartContract，且 Decimals > 0。
-func getContractMetaFromTargetInfo(contractAddr string, targetInfo interface{}) (*types.SmartContract, error) {
-	if targetInfo == nil {
-		return nil, fmt.Errorf("contract target matched but TargetInfo is nil")
+// getContractMetaFromTargetValue 从合约命中值中提取合约元数据。
+// 约定：业务层返回 *types.Coin / types.Coin（兼容 SmartContract 直传）。
+func getContractMetaFromTargetValue(contractAddr string, v interface{}) (*types.SmartContract, error) {
+	if v == nil {
+		return nil, fmt.Errorf("contract target matched but value is nil")
 	}
-
 	var meta *types.SmartContract
-	switch v := targetInfo.(type) {
+	switch x := v.(type) {
+	case *types.Coin:
+		if x == nil {
+			return nil, fmt.Errorf("contract coin is nil")
+		}
+		if !x.IsContract {
+			return nil, fmt.Errorf("contract coin is not contract type")
+		}
+		tmp := x.Contract
+		meta = &tmp
+	case types.Coin:
+		if !x.IsContract {
+			return nil, fmt.Errorf("contract coin is not contract type")
+		}
+		tmp := x.Contract
+		meta = &tmp
 	case *types.SmartContract:
-		meta = v
+		meta = x
 	case types.SmartContract:
-		tmp := v
+		tmp := x
 		meta = &tmp
 	default:
-		return nil, fmt.Errorf("unsupported TargetInfo type %T, need types.SmartContract", targetInfo)
+		return nil, fmt.Errorf("unsupported contract target value type %T", v)
 	}
-
+	if meta == nil {
+		return nil, fmt.Errorf("contract metadata is nil")
+	}
 	if meta.Decimals == 0 {
 		return nil, fmt.Errorf("contract metadata decimals is 0")
 	}
-
-	// 若业务层未填地址，回填当前日志里的合约地址；若填了且不一致，直接报错。
 	if meta.Address == "" {
 		meta.Address = contractAddr
 	} else if !strings.EqualFold(meta.Address, contractAddr) {
@@ -1166,7 +1358,7 @@ func extractAddressFromTopic(topic string) string {
 // scanTargetFunc: 优先使用 bs.ScanTargetFunc，未设置时使用传入参数。返回 nil 表示地址未监控。
 //
 // 提取规则：
-//   - 过滤：交易必须上链且回执成功（status=1），pending/失败交易返回 nil
+//   - 过滤：交易必须上链；pending 交易返回 nil；失败交易仅保留手续费记录
 //   - 主币：value>0 时按 from/to 归属生成 send/receive/internal 记录，OutputIndex=-1
 //   - 合约创建：to 为空时捕获 contractAddress，生成记录并标记 ExtParam["contract_creation"]
 //   - 手续费：统一生成独立 GAS 记录（FeeType=gas, TxAction=fee, OutputIndex=-2），Fees=feeStr
@@ -1310,6 +1502,135 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	var contractReceipts []*types.ContractReceiptItem
 	matched := false // 标记是否有地址命中监控
 
+	// 预提取本交易涉及的所有目标，按类型分批查询一次，减少往返。
+	accountBatch := types.ScanTargetParam{
+		Symbol:         bs.wm.Config.Symbol,
+		ScanTargetType: types.ScanTargetTypeAccountAddress,
+		ScanTarget:     make(map[string]interface{}, 16),
+	}
+	contractBatch := types.ScanTargetParam{
+		Symbol:         bs.wm.Config.Symbol,
+		ScanTargetType: types.ScanTargetTypeContractAddress,
+		ScanTarget:     make(map[string]interface{}, 8),
+	}
+	appendAccountTarget := func(addr string) {
+		if addr == "" {
+			return
+		}
+		if _, ok := accountBatch.ScanTarget[addr]; !ok {
+			accountBatch.ScanTarget[addr] = nil
+		}
+	}
+	appendContractTarget := func(addr string) {
+		if addr == "" {
+			return
+		}
+		if _, ok := contractBatch.ScanTarget[addr]; !ok {
+			contractBatch.ScanTarget[addr] = nil
+		}
+	}
+	if from != "" {
+		appendAccountTarget(from)
+	}
+	if to != "" {
+		appendAccountTarget(to)
+	}
+	// 合约创建地址（若有）也加入目标列表
+	createdAddr := ""
+	if rcRes != nil {
+		createdAddr = strings.ToLower(rcRes.Get("contractAddress").String())
+	}
+	if createdAddr != "" && isValidAddress(createdAddr) {
+		appendAccountTarget(createdAddr)
+	}
+	// 预扫描 ERC20 Transfer 相关目标（合约地址 + from/to 地址）
+	const transferTopicSig = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	if rcRes != nil {
+		for _, lg := range rcRes.Get("logs").Array() {
+			if !lg.IsObject() {
+				continue
+			}
+			topics := lg.Get("topics").Array()
+			if len(topics) == 0 || !strings.EqualFold(topics[0].String(), transferTopicSig) {
+				continue
+			}
+			contractAddr := strings.ToLower(lg.Get("address").String())
+			if contractAddr != "" {
+				appendContractTarget(contractAddr)
+			}
+			if len(topics) >= 2 {
+				fromToken := extractAddressFromTopic(topics[1].String())
+				if fromToken != "" {
+					appendAccountTarget(fromToken)
+				}
+			}
+			if len(topics) >= 3 {
+				toToken := extractAddressFromTopic(topics[2].String())
+				if toToken != "" {
+					appendAccountTarget(toToken)
+				}
+			}
+		}
+	}
+
+	if len(accountBatch.ScanTarget) > 0 {
+		if err := scanTargetFunc(&accountBatch); err != nil {
+			return nil, nil, false, err
+		}
+	}
+	if len(contractBatch.ScanTarget) > 0 {
+		if err := scanTargetFunc(&contractBatch); err != nil {
+			return nil, nil, false, err
+		}
+	}
+
+	resolveAccountID := func(target string, v interface{}) string {
+		if v == nil {
+			return ""
+		}
+		switch r := v.(type) {
+		case string:
+			return r
+		case bool:
+			if !r {
+				return ""
+			}
+			return target
+		default:
+			return fmt.Sprintf("%v", r)
+		}
+	}
+	queryAccountTarget := func(t types.ScanTargetParam) string {
+		target := ""
+		for k := range t.ScanTarget {
+			target = strings.ToLower(k)
+			break
+		}
+		if target == "" {
+			return ""
+		}
+		v, ok := accountBatch.ScanTarget[target]
+		if !ok || v == nil {
+			return ""
+		}
+		return resolveAccountID(target, v)
+	}
+	queryContractTarget := func(t types.ScanTargetParam) interface{} {
+		target := ""
+		for k := range t.ScanTarget {
+			target = strings.ToLower(k)
+			break
+		}
+		if target == "" {
+			return nil
+		}
+		v, ok := contractBatch.ScanTarget[target]
+		if !ok || v == nil {
+			return nil
+		}
+		return v
+	}
+
 	// 辅助函数：向 extractData 中添加数据，按 SourceKey 聚合
 	appendExtractData := func(sourceKey string, data *types.TxExtractData) {
 		// 严格校验：确保 Transaction 的地址和金额列表一一对应
@@ -1341,12 +1662,12 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	// 3.1 手续费独立 GAS 记录
 	if from != "" && fee != nil && fee.Sign() > 0 {
 		fromFeeParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, from)
-		fromFeeRes := scanTargetFunc(fromFeeParam)
-		if fromFeeRes != nil {
+		fromFeeAccountID := queryAccountTarget(fromFeeParam)
+		if fromFeeAccountID != "" {
 			matched = true
 			feeTxObj := &types.Transaction{
 				TxID:        txid,
-				AccountID:   fromFeeRes.SourceKey,
+				AccountID:   fromFeeAccountID,
 				Coin:        ethCoin,
 				BlockHash:   blockHash,
 				BlockHeight: blockHeight,
@@ -1366,7 +1687,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = feeTxObj
-			appendExtractData(fromFeeRes.SourceKey, data)
+			appendExtractData(fromFeeAccountID, data)
 		}
 	}
 
@@ -1378,13 +1699,11 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 	// 3. 主币转账
 	if amount != nil && amount.Sign() > 0 && from != "" {
 		actualTo := to
-		var toRes *types.ScanTargetResult
-		toResExist := false
+		toAccountID := ""
 		if actualTo != "" {
 			toParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, actualTo)
-			toRes = scanTargetFunc(toParam)
-			toResExist = toRes != nil
-			if toResExist {
+			toAccountID = queryAccountTarget(toParam)
+			if toAccountID != "" {
 				matched = true
 			}
 		}
@@ -1410,13 +1729,13 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			// 检查新创建的合约地址是否被监控（重要：合约创建时转入的 ETH 归属）
 			if createdAddr != "" {
 				createdParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, createdAddr)
-				createdRes := scanTargetFunc(createdParam)
-				if createdRes != nil {
+				createdAccountID := queryAccountTarget(createdParam)
+				if createdAccountID != "" {
 					matched = true
 					// 为创建的合约地址生成 receive 记录（入账）
 					txObj := &types.Transaction{
 						TxID:        txid,
-						AccountID:   createdRes.SourceKey,
+						AccountID:   createdAccountID,
 						Coin:        ethCoin,
 						BlockHash:   blockHash,
 						BlockHeight: blockHeight,
@@ -1435,24 +1754,24 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 					}
 					data := types.NewTxExtractData()
 					data.Transaction = txObj
-					appendExtractData(createdRes.SourceKey, data)
+					appendExtractData(createdAccountID, data)
 				}
 			}
 		}
 
 		fromParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, from)
-		fromRes := scanTargetFunc(fromParam)
-		if fromRes != nil {
+		fromAccountID := queryAccountTarget(fromParam)
+		if fromAccountID != "" {
 			matched = true
 			// 判断是否为内部转账（双方属于同一账户）
-			isInternal := toResExist && toRes != nil && toRes.SourceKey == fromRes.SourceKey
+			isInternal := toAccountID != "" && toAccountID == fromAccountID
 			txAction := "send"
 			if isInternal {
 				txAction = "internal"
 			}
 			txObj := &types.Transaction{
 				TxID:        txid,
-				AccountID:   fromRes.SourceKey,
+				AccountID:   fromAccountID,
 				Coin:        ethCoin,
 				BlockHash:   blockHash,
 				BlockHeight: blockHeight,
@@ -1471,14 +1790,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
-			appendExtractData(fromRes.SourceKey, data)
+			appendExtractData(fromAccountID, data)
 		}
 
-		if toResExist && actualTo != "" {
-			if fromRes == nil || toRes.SourceKey != fromRes.SourceKey {
+		if toAccountID != "" && actualTo != "" {
+			if fromAccountID == "" || toAccountID != fromAccountID {
 				txObj := &types.Transaction{
 					TxID:        txid,
-					AccountID:   toRes.SourceKey,
+					AccountID:   toAccountID,
 					Coin:        ethCoin,
 					BlockHash:   blockHash,
 					BlockHeight: blockHeight,
@@ -1497,7 +1816,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 				}
 				data := types.NewTxExtractData()
 				data.Transaction = txObj
-				appendExtractData(toRes.SourceKey, data)
+				appendExtractData(toAccountID, data)
 			}
 		}
 	}
@@ -1566,16 +1885,16 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 
 		// 先做合约白名单校验：type=contract, symbol=eth, scanTarget=contractAddr
 		contractParam := types.NewScanTargetParamForContract(bs.wm.Config.Symbol, contractAddr)
-		contractRes := scanTargetFunc(contractParam)
-		if contractRes == nil {
+		contractVal := queryContractTarget(contractParam)
+		if contractVal == nil {
 			// 合约未命中（非白名单）直接跳过该 ERC20 事件
 			continue
 		}
 
-		// 必须由业务层在 TargetInfo 返回合约元数据（含 decimals）；缺失则报错给上层。
-		contractMeta, err := getContractMetaFromTargetInfo(contractAddr, contractRes.TargetInfo)
+		// 合约命中值建议直接返回 *types.Coin（或 types.Coin），此处统一解析为合约元数据。
+		contractMeta, err := getContractMetaFromTargetValue(contractAddr, contractVal)
 		if err != nil {
-			return nil, nil, false, fmt.Errorf("invalid contract TargetInfo for %s: %v", contractAddr, err)
+			return nil, nil, false, fmt.Errorf("invalid contract target value for %s: %v", contractAddr, err)
 		}
 		tokenDecimals := int32(contractMeta.Decimals)
 		tokenAmountStr := util.BigIntToDecimal(tokenAmount, tokenDecimals)
@@ -1588,14 +1907,14 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 
 		// 再做账户归属校验：type=account, symbol=eth, scanTarget=userAddress
 		fromParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, fromToken)
-		fromRes := scanTargetFunc(fromParam)
+		fromAccountID := queryAccountTarget(fromParam)
 		toParam := types.NewScanTargetParamForAddress(bs.wm.Config.Symbol, toToken)
-		toRes := scanTargetFunc(toParam)
+		toAccountID := queryAccountTarget(toParam)
 
 		// 判断是否为内部转账（双方属于同一账户）
-		isInternalToken := fromRes != nil && toRes != nil && fromRes.SourceKey == toRes.SourceKey
+		isInternalToken := fromAccountID != "" && toAccountID != "" && fromAccountID == toAccountID
 
-		if fromRes != nil {
+		if fromAccountID != "" {
 			matched = true
 			txAction := "send"
 			if isInternalToken {
@@ -1603,7 +1922,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			txObj := &types.Transaction{
 				TxID:        txid,
-				AccountID:   fromRes.SourceKey,
+				AccountID:   fromAccountID,
 				Coin:        tokenCoin,
 				BlockHash:   blockHash,
 				BlockHeight: blockHeight,
@@ -1621,13 +1940,13 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
-			appendExtractData(fromRes.SourceKey, data)
+			appendExtractData(fromAccountID, data)
 		}
-		if toRes != nil && !isInternalToken {
+		if toAccountID != "" && !isInternalToken {
 			matched = true
 			txObj := &types.Transaction{
 				TxID:        txid,
-				AccountID:   toRes.SourceKey,
+				AccountID:   toAccountID,
 				Coin:        tokenCoin,
 				BlockHash:   blockHash,
 				BlockHeight: blockHeight,
@@ -1645,7 +1964,7 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 			}
 			data := types.NewTxExtractData()
 			data.Transaction = txObj
-			appendExtractData(toRes.SourceKey, data)
+			appendExtractData(toAccountID, data)
 		}
 
 		receiptKey := txid + ":" + contractAddr + ":" + strconv.Itoa(logIdx)

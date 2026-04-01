@@ -34,7 +34,7 @@ const testConfigJSON = `{
   "useMoralisAPIParseBlock": "0"
 }`
 
-const testHeight = 651
+const testHeight = 461929
 const testHeightToken = 426525
 
 // TestStartBlockScanner 演示如何在业务侧完整初始化适配器和扫块器：
@@ -59,7 +59,7 @@ func TestStartBlockScanner(t *testing.T) {
 	}
 
 	// 1）设置 ScanTargetFunc：本用例不关心交易提取，因此全部返回 nil
-	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
+	_ = bs.SetBlockScanTargetFunc(func(target *types.ScanTargetParam) error {
 		return nil
 	})
 
@@ -103,17 +103,26 @@ func TestScanBlockWithResultFlow(t *testing.T) {
 	bs.SetTxExtractConcurrency(20)
 
 	// 为了让扫块器真正跑提取逻辑，这里让 ScanTargetFunc “全部命中”，避免 ExtractData 永远为空。
-	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
-		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
-			return &types.ScanTargetResult{
-				SourceKey: "test",
-				TargetInfo: &types.SmartContract{
-					Address:  strings.ToLower(target.ScanTarget),
-					Decimals: 18,
-				},
+	_ = bs.SetBlockScanTargetFunc(func(target *types.ScanTargetParam) error {
+		if target == nil {
+			return nil
+		}
+		for scanTarget := range target.ScanTarget {
+			switch target.ScanTargetType {
+			case types.ScanTargetTypeContractAddress:
+				target.ScanTarget[scanTarget] = &types.Coin{
+					Symbol:     "ETH",
+					IsContract: true,
+					Contract: types.SmartContract{
+						Address:  strings.ToLower(scanTarget),
+						Decimals: 18,
+					},
+				}
+			default:
+				target.ScanTarget[scanTarget] = "test"
 			}
 		}
-		return &types.ScanTargetResult{SourceKey: "test"}
+		return nil
 	})
 
 	header, err := bs.GetCurrentBlockHeader()
@@ -168,17 +177,26 @@ func TestVerifyTransactionByTxID(t *testing.T) {
 	}
 
 	// 全命中，确保能产出结果集（注意：Verify 仍会受"tx 是否成功/确认数"影响）
-	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
-		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
-			return &types.ScanTargetResult{
-				SourceKey: "test",
-				TargetInfo: &types.SmartContract{
-					Address:  strings.ToLower(target.ScanTarget),
-					Decimals: 18,
-				},
+	_ = bs.SetBlockScanTargetFunc(func(target *types.ScanTargetParam) error {
+		if target == nil {
+			return nil
+		}
+		for scanTarget := range target.ScanTarget {
+			switch target.ScanTargetType {
+			case types.ScanTargetTypeContractAddress:
+				target.ScanTarget[scanTarget] = &types.Coin{
+					Symbol:     "ETH",
+					IsContract: true,
+					Contract: types.SmartContract{
+						Address:  strings.ToLower(scanTarget),
+						Decimals: 18,
+					},
+				}
+			default:
+				target.ScanTarget[scanTarget] = "test"
 			}
 		}
-		return &types.ScanTargetResult{SourceKey: "test"}
+		return nil
 	})
 
 	// 从 latest block 中选择一个 txid：这里通过 ScanBlockWithResult 无法拿到 txid，因此直接用扫块器内部 RPC（已通过接口封装）：
@@ -236,17 +254,26 @@ func TestVerifyTransactionMatch(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected BlockScanner type: %T", rawScanner)
 	}
-	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
-		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
-			return &types.ScanTargetResult{
-				SourceKey: "test",
-				TargetInfo: &types.SmartContract{
-					Address:  strings.ToLower(target.ScanTarget),
-					Decimals: 18,
-				},
+	_ = bs.SetBlockScanTargetFunc(func(target *types.ScanTargetParam) error {
+		if target == nil {
+			return nil
+		}
+		for scanTarget := range target.ScanTarget {
+			switch target.ScanTargetType {
+			case types.ScanTargetTypeContractAddress:
+				target.ScanTarget[scanTarget] = &types.Coin{
+					Symbol:     "ETH",
+					IsContract: true,
+					Contract: types.SmartContract{
+						Address:  strings.ToLower(scanTarget),
+						Decimals: 18,
+					},
+				}
+			default:
+				target.ScanTarget[scanTarget] = "test"
 			}
 		}
-		return &types.ScanTargetResult{SourceKey: "test"}
+		return nil
 	})
 
 	// 取 latest 区块第一笔 txid
@@ -362,20 +389,29 @@ func TestScanBlockOnce(t *testing.T) {
 	}
 
 	// 全命中，确保能产出结果集（若本地节点对应高度无交易也可正常返回）。
-	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
-		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
-			return &types.ScanTargetResult{
-				SourceKey: "test2",
-				TargetInfo: &types.SmartContract{
-					Address:  strings.ToLower(target.ScanTarget),
-					Decimals: 18,
-				},
+	_ = bs.SetBlockScanTargetFunc(func(target *types.ScanTargetParam) error {
+		if target == nil {
+			return nil
+		}
+		for scanTarget := range target.ScanTarget {
+			if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+				target.ScanTarget[scanTarget] = &types.Coin{
+					Symbol:     "ETH",
+					IsContract: true,
+					Contract: types.SmartContract{
+						Address:  strings.ToLower(scanTarget),
+						Decimals: 18,
+					},
+				}
+				continue
+			}
+			if strings.EqualFold(scanTarget, "0x301db155664284b1462e1a10c082a9ff6e2b617f") {
+				target.ScanTarget[scanTarget] = "test1"
+			} else {
+				target.ScanTarget[scanTarget] = "test2"
 			}
 		}
-		if target.ScanTarget == "0x301db155664284b1462e1a10c082a9ff6e2b617f" {
-			return &types.ScanTargetResult{SourceKey: "test1"}
-		}
-		return &types.ScanTargetResult{SourceKey: "test2"}
+		return nil
 	})
 
 	start := time.Now()
@@ -426,20 +462,25 @@ func TestScanBlockOnceToken(t *testing.T) {
 	}
 
 	// 全命中，确保能产出结果集（若本地节点对应高度无交易也可正常返回）。
-	_ = bs.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
-		if target.ScanTargetType == types.ScanTargetTypeAccountAddress {
-			return &types.ScanTargetResult{SourceKey: "test1"}
+	_ = bs.SetBlockScanTargetFunc(func(target *types.ScanTargetParam) error {
+		if target == nil {
+			return nil
 		}
-		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
-			return &types.ScanTargetResult{
-				SourceKey: "test2",
-				TargetInfo: &types.SmartContract{
-					Address:  strings.ToLower(target.ScanTarget),
-					Decimals: 18,
-				},
+		for scanTarget := range target.ScanTarget {
+			if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+				target.ScanTarget[scanTarget] = &types.Coin{
+					Symbol:     "ETH",
+					IsContract: true,
+					Contract: types.SmartContract{
+						Address:  strings.ToLower(scanTarget),
+						Decimals: 18,
+					},
+				}
+				continue
 			}
+			target.ScanTarget[scanTarget] = "test1"
 		}
-		return &types.ScanTargetResult{SourceKey: "test2"}
+		return nil
 	})
 
 	start := time.Now()
@@ -483,17 +524,25 @@ func TestRunScanLoopContinuously(t *testing.T) {
 	rawScanner := adapter.GetBlockScanner()
 
 	// 让扫块器真正运行提取逻辑（可根据本地节点情况调整）。
-	_ = rawScanner.SetBlockScanTargetFunc(func(target types.ScanTargetParam) *types.ScanTargetResult {
-		if target.ScanTargetType == types.ScanTargetTypeContractAddress {
-			return &types.ScanTargetResult{
-				SourceKey: "test",
-				TargetInfo: &types.SmartContract{
-					Address:  strings.ToLower(target.ScanTarget),
-					Decimals: 18,
-				},
+	_ = rawScanner.SetBlockScanTargetFunc(func(target *types.ScanTargetParam) error {
+		if target == nil {
+			return nil
+		}
+		for scanTarget := range target.ScanTarget {
+			if target.ScanTargetType == types.ScanTargetTypeContractAddress {
+				target.ScanTarget[scanTarget] = &types.Coin{
+					Symbol:     "ETH",
+					IsContract: true,
+					Contract: types.SmartContract{
+						Address:  strings.ToLower(scanTarget),
+						Decimals: 18,
+					},
+				}
+			} else {
+				target.ScanTarget[scanTarget] = "test"
 			}
 		}
-		return &types.ScanTargetResult{SourceKey: "test"}
+		return nil
 	})
 
 	latest := rawScanner.GetGlobalMaxBlockHeight()
