@@ -28,38 +28,16 @@ type EthTransactionDecoder struct {
 	Wm *manager.WalletManager
 }
 
-// addressListPageSize 默认分页大小（在未根据总数自适应前的基准值）。
-// 实际使用时会先通过 WalletDAI.GetAddressList(countQ=true) 拿到账户地址总数，
-// 再结合 AddressLimit 动态计算每页 limit，避免一次性拉取全部地址或频繁扩容结果集。
+// addressListPageSize 汇总交易默认分页大小（纯 lastID 分页，不做 count）。
 const addressListPageSize = int64(50)
 
-// calcAddressPageSize 根据总数与 AddressLimit 估算合适的分页大小：
-// - 少量地址（<=100）时直接一次取完，减少 RPC/DB 往返；
-// - 中等规模（<=1000、<=10000）按 100、500 分块；
-// - 超大规模默认按 2000 分块，减少分页次数。
-// 这样既兼顾了 ScanWrapper.GetAddressList(limit) 内部的容量预估，又避免单页过大导致的内存浪费。
-func calcAddressPageSize(total, limit int64) int64 {
-	if total <= 0 {
-		return addressListPageSize
-	}
-	// 有 AddressLimit 时，最多只需要处理 limit 条
-	effective := total
-	if limit > 0 && limit < effective {
-		effective = limit
-	}
+// createTxAddressPageSize 创建单笔交易时的候选地址分页大小。
+// 建单只需尽快命中一个可用地址，默认取较小批次以减少单次资源消耗。
+const createTxAddressPageSize = int64(5)
 
-	switch {
-	case effective <= 100:
-		// 少量地址时直接一次性取完，避免多次往返
-		return effective
-	case effective <= 1000:
-		return 100
-	case effective <= 10000:
-		return 500
-	default:
-		return 2000
-	}
-}
+// createTxAddressDepth 创建单笔交易时的最大翻页深度（每页 5 个）。
+// 若在该深度内仍无法构建成功，通常意味着候选数据与链上可用余额/手续费存在异常。
+const createTxAddressDepth = int64(2)
 
 // NewTransactionDecoder 创建交易解码器
 func NewTransactionDecoder(wm *manager.WalletManager) *EthTransactionDecoder {
@@ -129,14 +107,22 @@ func (d *EthTransactionDecoder) createSimpleRawTransaction(wrapper wallet.Wallet
 		return types.ConvertError(err)
 	}
 
-	// 分页查询地址，每页内检查余额，找到足够余额的地址即返回，避免一次拉取全部
+	// 分页查询地址余额列表（按余额倒序），但建单仍使用原有链上余额+估费逻辑
 	var lastID int64 = 0
+	var lastTransfer string
+	var pagesFetched int64 = 0
 	for {
-		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
-			LastID:    lastID,
-			Limit:     addressListPageSize,
-			AccountID: accountID,
+		if pagesFetched >= createTxAddressDepth {
+			break
+		}
+		addresses, _, err := wrapper.GetAddressBalanceList(wallet.SearchParams{
+			LastID:       lastID,
+			LastTransfer: lastTransfer,
+			Limit:        createTxAddressPageSize,
+			AccountID:    accountID,
+			MinTransfer:  amountStr,
 		})
+		pagesFetched++
 		if err != nil {
 			return types.NewError(types.ErrAddressNotFound, err.Error())
 		}
@@ -173,23 +159,40 @@ func (d *EthTransactionDecoder) createSimpleRawTransaction(wrapper wallet.Wallet
 			}
 			return d.buildRawTransaction(wrapper, rawTx, findBalance, feeInfo, "", tmpNonce)
 		}
-		if int64(len(addresses)) < addressListPageSize {
+		if int64(len(addresses)) < createTxAddressPageSize {
 			break
 		}
-		lastID = getLastAddressID(addresses)
+		var cursorErr error
+		lastID, lastTransfer, cursorErr = getLastAssetBalanceCursor(addresses)
+		if cursorErr != nil {
+			return cursorErr
+		}
 		if lastID <= 0 {
 			break
 		}
 	}
+	if pagesFetched >= createTxAddressDepth {
+		return types.Errorf(types.ErrCreateRawTransactionFailed,
+			"failed to build raw transaction after %d pages (%d address candidates); data may be abnormal",
+			createTxAddressDepth, createTxAddressDepth*createTxAddressPageSize,
+		)
+	}
 	return types.Errorf(types.ErrInsufficientBalanceOfAccount, "insufficient balance for %s", amountStr)
 }
 
-// getLastAddressID 取分页结果中最后一条的 ID 用于下一页 lastID；空列表返回 0
-func getLastAddressID(addresses []*types.Address) int64 {
-	if len(addresses) == 0 {
-		return 0
+// getLastAssetBalanceCursor 取余额分页结果最后一条记录用于复合游标。
+// - lastID：用于分页游标 LastID
+// - lastTransfer：用于复合游标 LastTransfer（必须使用 ConfirmBalance；若为空则返回非法数据错误）
+func getLastAssetBalanceCursor(items []*types.AssetBalance) (int64, string, error) {
+	if len(items) == 0 {
+		return 0, "", nil
 	}
-	return addresses[len(addresses)-1].ID
+	last := items[len(items)-1]
+	lastTransfer := last.ConfirmBalance
+	if lastTransfer == "" {
+		return 0, "", types.Errorf(types.ErrSystemException, "illegal asset balance: ConfirmBalance is empty")
+	}
+	return last.ID, lastTransfer, nil
 }
 
 // createErc20RawTransaction 创建 ERC20 转账原始交易：分页查地址，选代币余额与原生余额均足够的地址，编码 transfer(to, amount) 后建单
@@ -214,13 +217,22 @@ func (d *EthTransactionDecoder) createErc20RawTransaction(wrapper wallet.WalletD
 	}
 
 	lastID := int64(0)
+	var lastTransfer string
 	var errTokenBalance, errBalance string
+	var pagesFetched int64 = 0
 	for {
-		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
-			LastID:    lastID,
-			Limit:     addressListPageSize,
-			AccountID: rawTx.Account.AccountID,
+		if pagesFetched >= createTxAddressDepth {
+			break
+		}
+		addresses, _, err := wrapper.GetAddressBalanceList(wallet.SearchParams{
+			LastID:          lastID,
+			LastTransfer:    lastTransfer,
+			Limit:           createTxAddressPageSize,
+			AccountID:       rawTx.Account.AccountID,
+			ContractAddress: contractAddr,
+			MinTransfer:     amountStr,
 		})
+		pagesFetched++
 		if err != nil {
 			return types.NewError(types.ErrAddressNotFound, err.Error())
 		}
@@ -258,13 +270,23 @@ func (d *EthTransactionDecoder) createErc20RawTransaction(wrapper wallet.WalletD
 			ab := &models.AddrBalance{Address: addr.Address, Balance: nativeBal, TokenBalance: tokenBal}
 			return d.buildRawTransaction(wrapper, rawTx, ab, feeInfo, hex.EncodeToString(data), nil)
 		}
-		if int64(len(addresses)) < addressListPageSize {
+		if int64(len(addresses)) < createTxAddressPageSize {
 			break
 		}
-		lastID = getLastAddressID(addresses)
+		var cursorErr error
+		lastID, lastTransfer, cursorErr = getLastAssetBalanceCursor(addresses)
+		if cursorErr != nil {
+			return cursorErr
+		}
 		if lastID <= 0 {
 			break
 		}
+	}
+	if pagesFetched >= createTxAddressDepth {
+		return types.Errorf(types.ErrCreateRawTransactionFailed,
+			"failed to build ERC20 raw transaction after %d pages (%d address candidates); data may be abnormal",
+			createTxAddressDepth, createTxAddressDepth*createTxAddressPageSize,
+		)
 	}
 	if errTokenBalance != "" {
 		return types.Errorf(types.ErrInsufficientTokenBalanceOfAddress, "%s", errTokenBalance)
@@ -508,16 +530,7 @@ func (d *EthTransactionDecoder) CreateSummaryRawTransactionWithError(wrapper wal
 	return d.createNativeSummaryRawTransaction(wrapper, sumRawTx)
 }
 
-// createNativeSummaryRawTransaction 原生币汇总交易；逻辑与原先 CreateSummaryRawTransactionWithError 保持一致。
-// createNativeSummaryRawTransaction 原生币汇总交易：
-// 1. 通过 countQ=true 的 GetAddressList 获取账户地址总数 total；
-// 2. 基于 total 与 AddressLimit 计算每页 limit（calcAddressPageSize），尽量一次取完小批量地址；
-// 3. 按 lastID 游标分页遍历地址，计算可汇总金额 = 余额 - 保留余额 - 手续费；
-// 4. 为每个满足条件的地址构建 RawTransactionWithError，既返回成功交易，也保留单地址构建失败的错误。
-// 设计目标：
-// - 地址数量很大（上万、十万）时，减少分页次数与切片扩容；
-// - 地址数量很少时，一次取完，避免多次 RPC/DB 往返；
-// - AddressLimit 生效时，只处理前 N 条地址，最后一页按“剩余条数”精确设定 limit，避免过大预分配。
+// createNativeSummaryRawTransaction 原生币汇总交易：纯 lastID 分页，不做 count。
 func (d *EthTransactionDecoder) createNativeSummaryRawTransaction(wrapper wallet.WalletDAI, sumRawTx *types.SummaryRawTransaction) ([]*types.RawTransactionWithError, error) {
 	minTransfer, _ := util.StringToBigInt(sumRawTx.MinTransfer, d.Wm.SymbolDecimal())
 	retainedBalance, _ := util.StringToBigInt(sumRawTx.RetainedBalance, d.Wm.SymbolDecimal())
@@ -527,42 +540,31 @@ func (d *EthTransactionDecoder) createNativeSummaryRawTransaction(wrapper wallet
 
 	var result []*types.RawTransactionWithError
 	lastID := sumRawTx.AddressStartIndex
+	var lastTransfer string
 
-	// 首次 countQ 查询总数，用于估算分页大小，减少地址很多时的内存扩容与分页次数
-	_, total, err := wrapper.GetAddressList(wallet.SearchParams{
-		CountQ:    true,
-		AccountID: sumRawTx.Account.AccountID,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if total == 0 {
-		return nil, types.Errorf(types.ErrAddressNotFound, "no addresses")
-	}
-	pageSize := calcAddressPageSize(total, sumRawTx.AddressLimit)
 	processedCount := int64(0)
 
 	for {
-		// 计算本页实际需要拉取的数量：
-		// - remaining = total - 已处理条数；
-		// - 若设置了 AddressLimit，则 remaining 还需受（AddressLimit - 已处理）约束；
-		// - curLimit = min(pageSize, remaining)，确保最后一页不会按 pageSize 预分配过大容量。
-		remaining := total - processedCount
-		if sumRawTx.AddressLimit > 0 && sumRawTx.AddressLimit-processedCount < remaining {
-			remaining = sumRawTx.AddressLimit - processedCount
-		}
-		if remaining <= 0 {
+		if sumRawTx.AddressLimit > 0 && processedCount >= sumRawTx.AddressLimit {
 			return result, nil
 		}
-		curLimit := pageSize
-		if remaining < curLimit {
-			curLimit = remaining
+		curLimit := addressListPageSize
+		if sumRawTx.AddressLimit > 0 {
+			left := sumRawTx.AddressLimit - processedCount
+			if left < curLimit {
+				curLimit = left
+			}
+		}
+		if curLimit <= 0 {
+			return result, nil
 		}
 
-		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
-			LastID:    lastID,
-			Limit:     curLimit,
-			AccountID: sumRawTx.Account.AccountID,
+		addresses, _, err := wrapper.GetAddressBalanceList(wallet.SearchParams{
+			LastID:       lastID,
+			LastTransfer: lastTransfer,
+			Limit:        curLimit,
+			AccountID:    sumRawTx.Account.AccountID,
+			MinTransfer:  sumRawTx.MinTransfer,
 		})
 		if err != nil {
 			return nil, err
@@ -571,7 +573,7 @@ func (d *EthTransactionDecoder) createNativeSummaryRawTransaction(wrapper wallet
 			if lastID == sumRawTx.AddressStartIndex {
 				return nil, types.Errorf(types.ErrAddressNotFound, "no addresses")
 			}
-			break
+			return result, nil
 		}
 		for _, addr := range addresses {
 			if sumRawTx.AddressLimit > 0 && processedCount >= sumRawTx.AddressLimit {
@@ -602,26 +604,18 @@ func (d *EthTransactionDecoder) createNativeSummaryRawTransaction(wrapper wallet
 			err = d.buildRawTransaction(wrapper, rawTx, ab, feeInfo, "", nil)
 			result = append(result, &types.RawTransactionWithError{RawTx: rawTx, Error: types.ConvertError(err)})
 		}
-		if int64(len(addresses)) < pageSize {
-			break
+		var cursorErr error
+		lastID, lastTransfer, cursorErr = getLastAssetBalanceCursor(addresses)
+		if cursorErr != nil {
+			return nil, cursorErr
 		}
-		lastID = getLastAddressID(addresses)
 		if lastID <= 0 {
-			break
+			return result, nil
 		}
 	}
-	return result, nil
 }
 
-// createErc20SummaryRawTransaction ERC20 汇总交易：遍历账户地址，按代币余额与主币余额构建汇总交易单。
-// 核心流程：
-// 1. 使用 countQ=true 的 GetAddressList 获取账户下地址总数 total，并结合 AddressLimit 计算分页大小；
-// 2. 分页拉取地址列表，每页先批量调用 SmartContractDecoder.GetTokenBalanceByAddress 获取本页所有地址的代币余额；
-// 3. 对于代币余额满足 minTransfer 且大于 0 的地址，按 (余额 - RetainedBalance) 计算可汇总数量；
-// 4. 使用 EncodeERC20Transfer(summaryAddress, sumAmount) 生成 transfer 调用 data，并估算主币手续费；
-// 5. 若主币余额足以支付手续费，则通过 buildRawTransaction 构造一笔 ERC20 汇总交易（to=合约地址，value=0，data=transfer）；
-// 6. 每个地址的构建结果（成功/失败）都会以 RawTransactionWithError 形式返回，调用方可逐条处理。
-// 这样在地址规模较大时仍能保持可控的内存与 RPC 次数，同时保证 ERC20 汇总语义清晰可靠。
+// createErc20SummaryRawTransaction ERC20 汇总交易：纯 lastID 分页，不做 count。
 func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.WalletDAI, sumRawTx *types.SummaryRawTransaction) ([]*types.RawTransactionWithError, error) {
 	if sumRawTx.Account == nil {
 		return nil, types.Errorf(types.ErrCreateRawTransactionFailed, "account is nil")
@@ -638,19 +632,8 @@ func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.
 
 	var result []*types.RawTransactionWithError
 	lastID := sumRawTx.AddressStartIndex
+	var lastTransfer string
 
-	// 首次 countQ 查询总数，用于估算分页大小，减少地址很多时的内存扩容与分页次数
-	_, total, err := wrapper.GetAddressList(wallet.SearchParams{
-		CountQ:    true,
-		AccountID: sumRawTx.Account.AccountID,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if total == 0 {
-		return nil, types.Errorf(types.ErrAddressNotFound, "no addresses")
-	}
-	pageSize := calcAddressPageSize(total, sumRawTx.AddressLimit)
 	processedCount := int64(0)
 
 	contractDec := NewSmartContractDecoder(d.Wm)
@@ -658,23 +641,27 @@ func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.
 	contractAddr := contract.Address
 
 	for {
-		// 计算本页实际需要拉取的数量，避免最后一页仍按 pageSize 预分配过大容量
-		remaining := total - processedCount
-		if sumRawTx.AddressLimit > 0 && sumRawTx.AddressLimit-processedCount < remaining {
-			remaining = sumRawTx.AddressLimit - processedCount
-		}
-		if remaining <= 0 {
+		if sumRawTx.AddressLimit > 0 && processedCount >= sumRawTx.AddressLimit {
 			return result, nil
 		}
-		curLimit := pageSize
-		if remaining < curLimit {
-			curLimit = remaining
+		curLimit := addressListPageSize
+		if sumRawTx.AddressLimit > 0 {
+			left := sumRawTx.AddressLimit - processedCount
+			if left < curLimit {
+				curLimit = left
+			}
+		}
+		if curLimit <= 0 {
+			return result, nil
 		}
 
-		addresses, _, err := wrapper.GetAddressList(wallet.SearchParams{
-			LastID:    lastID,
-			Limit:     curLimit,
-			AccountID: sumRawTx.Account.AccountID,
+		addresses, _, err := wrapper.GetAddressBalanceList(wallet.SearchParams{
+			LastID:          lastID,
+			LastTransfer:    lastTransfer,
+			Limit:           curLimit,
+			AccountID:       sumRawTx.Account.AccountID,
+			MinTransfer:     sumRawTx.MinTransfer,
+			ContractAddress: contractAddr,
 		})
 		if err != nil {
 			return nil, err
@@ -683,7 +670,7 @@ func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.
 			if lastID == sumRawTx.AddressStartIndex {
 				return nil, types.Errorf(types.ErrAddressNotFound, "no addresses")
 			}
-			break
+			return result, nil
 		}
 
 		// 批量查询本页地址的代币余额
@@ -751,14 +738,13 @@ func (d *EthTransactionDecoder) createErc20SummaryRawTransaction(wrapper wallet.
 			result = append(result, &types.RawTransactionWithError{RawTx: rawTx, Error: types.ConvertError(err)})
 		}
 
-		if int64(len(addresses)) < pageSize {
-			break
+		var cursorErr error
+		lastID, lastTransfer, cursorErr = getLastAssetBalanceCursor(addresses)
+		if cursorErr != nil {
+			return nil, cursorErr
 		}
-		lastID = getLastAddressID(addresses)
 		if lastID <= 0 {
-			break
+			return result, nil
 		}
 	}
-
-	return result, nil
 }
