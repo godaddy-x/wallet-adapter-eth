@@ -1712,9 +1712,9 @@ func (bs *EthBlockScanner) extractTransactionAndReceiptDataFromParsed(
 		var ext map[string]string
 		var createdAddr string
 		if isContractCreation {
-			// 获取创建的合约地址（从回执中）
+			// 获取创建的合约地址（从回执中）；与业务库、ScanTarget 批量预热一致统一小写
 			if rcRes != nil {
-				createdAddr = rcRes.Get("contractAddress").String()
+				createdAddr = strings.TrimSpace(strings.ToLower(rcRes.Get("contractAddress").String()))
 			}
 			// 验证合约地址格式
 			if createdAddr != "" && !isValidAddress(createdAddr) {
