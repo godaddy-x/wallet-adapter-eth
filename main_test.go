@@ -552,7 +552,7 @@ func TestRunScanLoopContinuously(t *testing.T) {
 
 	// confirmations 仅用于计算 BlockHeader.Confirmations 字段供业务层参考
 	var confirmations uint64 = 6
-	startHeight := testHeight
+	startHeight := latest
 
 	go func() {
 		if err := rawScanner.RunScanLoop(adaptscanner.ScanLoopParams{
@@ -599,6 +599,13 @@ func TestRunScanLoopContinuously(t *testing.T) {
 		return
 	}
 	t.Logf("ScanBlockPrioritize called with heights: %v", prioritizeHeights)
+
+	time.Sleep(5 * time.Second)
+
+	if err := rawScanner.ResetScanHeight(100); err != nil {
+		t.Fatalf("ResetScanHeight error: %v", err)
+		return
+	}
 
 	t.Logf("RunScanLoop started: latest=%d startHeight=%d confirmations=%d running ~10 minutes...",
 		latest, startHeight, confirmations)

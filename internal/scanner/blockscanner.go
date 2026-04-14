@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -65,6 +66,14 @@ type EthBlockScanner struct {
 
 	scanLoopConfirmations uint64                       // 确认数要求
 	scanLoopHandleFunc    func(*types.BlockScanResult) // 扫描回调
+
+	// scanLoopCursor 与 RunScanLoop 内原 cursor 语义一致：表示已处理到的安全高度，
+	// 下一轮主线从 scanLoopCursor+1 开始；ResetScanHeight 可在循环运行中更新该值。
+	scanLoopCursor atomic.Uint64
+	// scanLoopRunning 为 true 表示当前 goroutine 正在执行 RunScanLoop（禁止并发再启）。
+	scanLoopRunning atomic.Bool
+	// scanLoopResetNonce 每次 ResetScanHeight 递增，用于打断内层 [scanFrom..safeTo] 批量扫描。
+	scanLoopResetNonce atomic.Uint64
 }
 
 // ScanBlockWithResult 按高度扫描并返回结果摘要。
@@ -742,6 +751,7 @@ func getContractMetaFromTargetValue(contractAddr string, v interface{}) (*types.
 // RunScanLoop 从外部指定的 StartHeight 开始（inclusive），持续按高度向上扫描，并始终只扫描已满足 Confirmations 的安全范围。
 //   - 设定 safeTo = latest - Confirmations（latest 为链上最新高度）
 //   - 每扫完一个区块高度就同步调用 HandleBlock（若 HandleBlock 为 nil 则忽略）。
+//   - 游标保存在 scanLoopCursor 上，运行中可通过 ResetScanHeight 调整；同一时刻仅允许一个 RunScanLoop。
 func (bs *EthBlockScanner) RunScanLoop(params adaptscanner.ScanLoopParams) error {
 	if bs.wm == nil || bs.wm.Client == nil {
 		return fmt.Errorf("wallet manager or rpc client is nil")
@@ -753,19 +763,26 @@ func (bs *EthBlockScanner) RunScanLoop(params adaptscanner.ScanLoopParams) error
 		params.Interval = 5 * time.Second
 	}
 
+	if !bs.scanLoopRunning.CompareAndSwap(false, true) {
+		return fmt.Errorf("RunScanLoop already running")
+	}
+	defer bs.scanLoopRunning.Store(false)
+
 	// 保存配置供插队扫描复用
 	bs.scanLoopConfirmations = params.Confirmations
 	bs.scanLoopHandleFunc = params.HandleBlock
 
-	// cursor: 已处理的安全高度（safeTo），初始化为 StartHeight-1
-	// 为了让第一次扫描命中 StartHeight，我们把 cursor 初始化到 StartHeight-1。
-	// 当 StartHeight==0 时，cursor 保持为 0，第一次扫描从 0 开始（inclusive）。
-	var cursor uint64
+	// cursor: 已处理到的安全高度（语义同旧版局部变量）；下一轮主线从 cursor+1 开始。
+	// StartHeight>0 时初始化为 StartHeight-1，使第一次扫描命中 StartHeight。
+	// StartHeight==0 时初始化为 0，与历史行为一致：scanFrom=cursor+1 即第一次从高度 1 开始（不扫创世块 0）。
+	bs.scanLoopResetNonce.Store(0)
+	var initialCursor uint64
 	if params.StartHeight == 0 {
-		cursor = 0
+		initialCursor = 0
 	} else {
-		cursor = params.StartHeight - 1
+		initialCursor = params.StartHeight - 1
 	}
+	bs.scanLoopCursor.Store(initialCursor)
 
 	for {
 		bs.blockIfPaused()
@@ -820,7 +837,7 @@ func (bs *EthBlockScanner) RunScanLoop(params adaptscanner.ScanLoopParams) error
 		// - 扫描失败不退出 loop；
 		// - 当某高度失败时，停留在该高度持续重试（不推进 cursor），并将失败结果回调给业务侧；
 		// - 业务侧可根据 res.ErrorReason 决定告警、跳过高度或调整策略。
-		scanFrom := cursor + 1
+		scanFrom := bs.scanLoopCursor.Load() + 1
 
 		// 无新高度时跳过内层扫描
 		// 此时直接跳过内层扫描，仅等待 interval 后再次检查
@@ -837,7 +854,13 @@ func (bs *EthBlockScanner) RunScanLoop(params adaptscanner.ScanLoopParams) error
 		// - 当某高度失败时，停留在该高度持续重试（不推进 cursor），并将失败结果回调给业务侧；
 		// - 业务侧可根据 res.ErrorReason 决定告警、跳过高度或调整策略。
 		completed := true
+		batchNonce := bs.scanLoopResetNonce.Load()
 		for h := scanFrom; h <= safeTo; h++ {
+			if bs.scanLoopResetNonce.Load() != batchNonce {
+				completed = false
+				break
+			}
+
 			bs.blockIfPaused()
 
 			// 每处理一个高度前，先检查并处理插队任务（真正的插队逻辑）
@@ -929,10 +952,11 @@ func (bs *EthBlockScanner) RunScanLoop(params adaptscanner.ScanLoopParams) error
 				}
 
 				// 将 cursor 更新到 h-1：下一轮从 h 开始重试，避免重复扫更早高度。
+				cur := bs.scanLoopCursor.Load()
 				if h == 0 {
-					cursor = 0
-				} else if h-1 > cursor {
-					cursor = h - 1
+					bs.scanLoopCursor.Store(0)
+				} else if h-1 > cur {
+					bs.scanLoopCursor.Store(h - 1)
 				}
 
 				// 停留在该高度重试
@@ -955,13 +979,36 @@ func (bs *EthBlockScanner) RunScanLoop(params adaptscanner.ScanLoopParams) error
 		// 将游标推进到当前轮的 safeTo。
 		// 只有当本轮完整扫过至 safeTo 时才推进；若中途失败 break，则停留在失败高度重试。
 		if completed {
-			cursor = safeTo
+			bs.scanLoopCursor.Store(safeTo)
 		}
 		select {
 		case <-time.After(params.Interval):
 		case <-bs.getPauseCh():
 		}
 	}
+}
+
+// ResetScanHeight 将 RunScanLoop 主线下一笔待扫高度调整为 height（含 height），无需重启循环。
+// 必须在已有 RunScanLoop 正在执行时调用；会打断当前正在进行的一批 [scanFrom..safeTo] 串行扫描，
+// 下一轮外循环将按新游标从 height 起继续（仍受 safeTo = latest - Confirmations 约束）。
+//
+// 语义说明：
+//   - 调整在当前区块 ScanBlockWithResult 返回之后才会在内层循环开头生效（不会在 RPC 中途打断）。
+//   - 若 height 小于当前批次内“下一个尚未扫描”的高度（回滚重扫），已在本轮成功回调的高度可能被再次扫描，属预期重复。
+//   - 若 height 大于该下一个高度（向前跳），中间被跳过的区间不会在本轮补扫，也不会再经本轮内层扫描；适用于外部已认定更高游标等场景，调用方需自行保证业务一致性。
+func (bs *EthBlockScanner) ResetScanHeight(height uint64) error {
+	if !bs.scanLoopRunning.Load() {
+		return fmt.Errorf("RunScanLoop is not running")
+	}
+	var newCursor uint64
+	if height == 0 {
+		newCursor = 0
+	} else {
+		newCursor = height - 1
+	}
+	bs.scanLoopCursor.Store(newCursor)
+	bs.scanLoopResetNonce.Add(1)
+	return nil
 }
 
 // ScanBlockOnce 指定高度扫描一次（用于补扫/漏扫修复）。
